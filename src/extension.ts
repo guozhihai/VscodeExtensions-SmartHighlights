@@ -726,7 +726,6 @@ class HighlightController {
 				const raw = fs.readFileSync(configPath, 'utf8');
 				config = JSON.parse(HighlightController.stripJsonComments(raw));
 			} else {
-				// eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-unsafe-assignment, global-require
 				const required = require(configPath);
 				config = (required as { default?: unknown })?.default ?? required;
 			}
