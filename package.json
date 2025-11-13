@@ -1,7 +1,7 @@
 {
   "name": "conditional-coloring",
   "displayName": "Smart Highlights",
-  "publisher": "SmartHighlights",
+  "publisher": "GuoZhihai",
   "description": "Highlight custom strings in the editor with per-rule colors and search options.",
   "icon": "media/icon.png",
   "repository": {
