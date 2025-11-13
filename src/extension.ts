@@ -739,6 +739,21 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			color: var(--vscode-input-foreground);
 		}
 
+		.form-options-row {
+			display: flex;
+			align-items: center;
+			gap: 8px;
+			flex-wrap: wrap;
+		}
+
+		.form-options-row .options-toggle-row {
+			flex: 1;
+		}
+
+		.form-options-row .color-row {
+			flex-shrink: 0;
+		}
+
 		.options-toggle-row,
 		.rule-options {
 			display: flex;
@@ -975,14 +990,16 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		</div>
 		<div id="newRuleForm" class="new-rule">
 			<input id="patternInput" type="text" placeholder="Highlight text or /regex/">
-			<div class="options-toggle-row" id="newRuleOptions">
-				<button type="button" class="option-toggle" data-option="matchCase" title="Match Case (Aa)">Aa</button>
-				<button type="button" class="option-toggle" data-option="matchWholeWord" title="Match Whole Word (W)">W</button>
-				<button type="button" class="option-toggle" data-option="useRegex" title="Use Regular Expression (.*)">.*</button>
-			</div>
-			<div class="color-row">
-				<input type="color" id="colorPicker" value="#00c4ff" aria-label="Highlight color">
-				<input type="text" id="colorText" class="color-text-hidden" value="#00c4ff55" tabindex="-1" aria-hidden="true">
+			<div class="form-options-row">
+				<div class="options-toggle-row" id="newRuleOptions">
+					<button type="button" class="option-toggle" data-option="matchCase" title="Match Case (Aa)">Aa</button>
+					<button type="button" class="option-toggle" data-option="matchWholeWord" title="Match Whole Word (W)">W</button>
+					<button type="button" class="option-toggle" data-option="useRegex" title="Use Regular Expression (.*)">.*</button>
+				</div>
+				<div class="color-row">
+					<input type="color" id="colorPicker" value="#00c400" aria-label="Highlight color">
+					<input type="text" id="colorText" class="color-text-hidden" value="#00c4005d" tabindex="-1" aria-hidden="true">
+				</div>
 			</div>
 		</div>
 		<div id="ruleList" class="rule-list"></div>
