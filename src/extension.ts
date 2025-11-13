@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 
 type NavigationDirection = 'next' | 'previous';
 type RuleOptionKey = 'matchCase' | 'matchWholeWord' | 'useRegex';
@@ -22,9 +24,11 @@ interface HighlightRule {
 	decoration: vscode.TextEditorDecorationType;
 	documentUri: string;
 	matchCount: number;
+	currentMatchIndex: number | null;
+	ranges: vscode.Range[];
 }
 
-interface PanelRule extends Omit<HighlightRule, 'decoration'> {
+interface PanelRule extends Omit<HighlightRule, 'decoration' | 'ranges'> {
 	description: string;
 }
 
@@ -33,6 +37,10 @@ type RuleMap = Map<string, HighlightRule[]>;
 class HighlightController {
 	private readonly rulesByDocument: RuleMap = new Map();
 	private readonly onDidChangeRulesEmitter = new vscode.EventEmitter<void>();
+	private static readonly defaultWordSeparators = `~!@#$%^&*()-=+[{]}\\|;:'",.<>/?`;
+	private static readonly wordSeparatorCache = new Map<string, Set<string>>();
+	private static readonly wordPatternCache = new Map<string, RegExp | null>();
+	private static readonly configWordPatternCache = new Map<string, RegExp | null>();
 
 	public readonly onDidChangeRules = this.onDidChangeRulesEmitter.event;
 
@@ -49,8 +57,12 @@ class HighlightController {
 			vscode.window.onDidChangeActiveTextEditor((editor) => {
 				if (editor) {
 					this.applyRules(editor);
+					this.updateCurrentMatchIndicesForEditor(editor);
 				}
 				this.notifyRulesChanged();
+			}),
+			vscode.window.onDidChangeTextEditorSelection((event) => {
+				this.updateCurrentMatchIndicesForEditor(event.textEditor, event.selections);
 			}),
 			vscode.workspace.onDidCloseTextDocument((document) => {
 				const uri = document.uri.toString();
@@ -192,8 +204,13 @@ class HighlightController {
 
 		const rules = this.rulesByDocument.get(uri) ?? [];
 		return rules.map((rule) => {
-			const { decoration: _decoration, ...rest } = rule;
-			return { ...rest, matchCount: rule.matchCount ?? 0, description: this.describeRule(rule) };
+			const { decoration: _decoration, ranges: _ranges, ...rest } = rule;
+			return {
+				...rest,
+				matchCount: rule.matchCount ?? 0,
+				currentMatchIndex: rule.currentMatchIndex ?? null,
+				description: this.describeRule(rule),
+			};
 		});
 	}
 
@@ -288,6 +305,8 @@ class HighlightController {
 		}
 
 		const matches = this.findMatches(editor.document, rule);
+		rule.matchCount = matches.length;
+		rule.ranges = matches;
 		if (matches.length === 0) {
 			void vscode.window.showInformationMessage(`No matches were found for "${rule.pattern}".`);
 			return;
@@ -374,6 +393,8 @@ class HighlightController {
 			decoration: HighlightController.createDecoration(color),
 			documentUri: uri,
 			matchCount: 0,
+			currentMatchIndex: null,
+			ranges: [],
 		};
 
 		if (rule.useRegex) {
@@ -437,7 +458,58 @@ class HighlightController {
 		for (const rule of rules) {
 			const ranges = this.findMatches(editor.document, rule);
 			rule.matchCount = ranges.length;
+			rule.ranges = ranges;
+			if (ranges.length === 0) {
+				rule.currentMatchIndex = null;
+			} else if (editor === vscode.window.activeTextEditor) {
+				rule.currentMatchIndex = HighlightController.computeSelectionMatchIndex(
+					editor.selection,
+					ranges,
+					editor.document
+				);
+			} else {
+				rule.currentMatchIndex = null;
+			}
 			editor.setDecorations(rule.decoration, ranges);
+		}
+	}
+
+	private updateCurrentMatchIndicesForEditor(
+		editor: vscode.TextEditor,
+		selections?: readonly vscode.Selection[]
+	) {
+		const uri = editor.document.uri.toString();
+		const rules = this.rulesByDocument.get(uri);
+		if (!rules || rules.length === 0) {
+			return;
+		}
+
+		const selection = selections?.[0] ?? editor.selection;
+		let changed = false;
+
+		for (const rule of rules) {
+			if (!rule.ranges) {
+				rule.ranges = [];
+			}
+			if (rule.ranges.length === 0 && rule.matchCount > 0) {
+				const ranges = this.findMatches(editor.document, rule);
+				rule.ranges = ranges;
+				rule.matchCount = ranges.length;
+			}
+
+			const index = HighlightController.computeSelectionMatchIndex(
+				selection,
+				rule.ranges,
+				editor.document
+			);
+			if (rule.currentMatchIndex !== index) {
+				rule.currentMatchIndex = index;
+				changed = true;
+			}
+		}
+
+		if (changed) {
+			this.notifyRulesChanged();
 		}
 	}
 
@@ -462,10 +534,50 @@ class HighlightController {
 
 			const start = document.positionAt(match.index);
 			const end = document.positionAt(match.index + match[0].length);
-			ranges.push(new vscode.Range(start, end));
+			const range = new vscode.Range(start, end);
+			if (rule.matchWholeWord && !this.isWholeWordMatch(document, range, text)) {
+				continue;
+			}
+			ranges.push(range);
 		}
 
 		return ranges;
+	}
+
+	private static computeSelectionMatchIndex(
+		selection: vscode.Selection | undefined,
+		ranges: vscode.Range[],
+		document: vscode.TextDocument
+	): number | null {
+		if (!selection || ranges.length === 0) {
+			return null;
+		}
+
+		const selectionStart = document.offsetAt(selection.start);
+		const selectionEnd = document.offsetAt(selection.end);
+		const isEmpty = selection.isEmpty;
+
+		for (let i = 0; i < ranges.length; i += 1) {
+			const range = ranges[i];
+			const rangeStart = document.offsetAt(range.start);
+			const rangeEnd = document.offsetAt(range.end);
+
+			if (!isEmpty) {
+				const matchesExactly = rangeStart === selectionStart && rangeEnd === selectionEnd;
+				const fullyContains = selectionStart <= rangeStart && selectionEnd >= rangeEnd;
+				if (matchesExactly || fullyContains) {
+					return i + 1;
+				}
+				continue;
+			}
+
+			const position = selectionStart;
+			if (position >= rangeStart && position <= rangeEnd) {
+				return i + 1;
+			}
+		}
+
+		return null;
 	}
 
 	private buildRegExp(rule: HighlightRule, overridePattern?: string): RegExp {
@@ -473,9 +585,8 @@ class HighlightController {
 		const source = rule.useRegex
 			? sourcePattern
 			: HighlightController.escapeForRegExp(sourcePattern);
-		const wrapped = rule.matchWholeWord ? `\\b${source}\\b` : source;
 		const flags = `g${rule.matchCase ? '' : 'i'}`;
-		return new RegExp(wrapped, flags);
+		return new RegExp(source, flags);
 	}
 
 	private describeRule(rule: HighlightRule): string {
@@ -517,7 +628,209 @@ class HighlightController {
 	}
 
 	private static escapeForRegExp(value: string): string {
-		return value.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+		return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	}
+
+	private isWholeWordMatch(document: vscode.TextDocument, range: vscode.Range, fullText: string): boolean {
+		const wordPattern = HighlightController.getLanguageWordPattern(document);
+		if (wordPattern) {
+			const wordRange = document.getWordRangeAtPosition(range.start, wordPattern);
+			return Boolean(wordRange && wordRange.isEqual(range));
+		}
+		return HighlightController.matchesWordSeparators(document, range, fullText);
+	}
+
+	private static matchesWordSeparators(
+		document: vscode.TextDocument,
+		range: vscode.Range,
+		fullText: string
+	): boolean {
+		const separators = HighlightController.getWordSeparators(document);
+		const startOffset = document.offsetAt(range.start);
+		const endOffset = document.offsetAt(range.end);
+		const beforeChar = startOffset > 0 ? fullText[startOffset - 1] : '';
+		const afterChar = endOffset < fullText.length ? fullText[endOffset] : '';
+		return (
+			!HighlightController.isWordCharacter(beforeChar, separators) &&
+			!HighlightController.isWordCharacter(afterChar, separators)
+		);
+	}
+
+	private static isWordCharacter(char: string | undefined, separators: Set<string>): boolean {
+		if (!char) {
+			return false;
+		}
+		if (/\s/.test(char)) {
+			return false;
+		}
+		return !separators.has(char);
+	}
+
+	private static getWordSeparators(document: vscode.TextDocument): Set<string> {
+		const separatorValue =
+			vscode.workspace.getConfiguration('editor', document).get<string>('wordSeparators') ??
+			HighlightController.defaultWordSeparators;
+		let cached = HighlightController.wordSeparatorCache.get(separatorValue);
+		if (!cached) {
+			cached = new Set(separatorValue.split(''));
+			HighlightController.wordSeparatorCache.set(separatorValue, cached);
+		}
+		return cached;
+	}
+
+	private static getLanguageWordPattern(document: vscode.TextDocument): RegExp | null {
+		const languageId = document.languageId;
+		if (HighlightController.wordPatternCache.has(languageId)) {
+			return HighlightController.wordPatternCache.get(languageId) ?? null;
+		}
+		const pattern = HighlightController.loadWordPatternForLanguage(languageId);
+		HighlightController.wordPatternCache.set(languageId, pattern ?? null);
+		return pattern ?? null;
+	}
+
+	private static loadWordPatternForLanguage(languageId: string): RegExp | null {
+		for (const extension of vscode.extensions.all) {
+			const contributes = extension.packageJSON?.contributes;
+			if (!contributes) {
+				continue;
+			}
+			const languages = Array.isArray(contributes.languages) ? contributes.languages : [];
+			for (const language of languages) {
+				if (language?.id !== languageId || !language.configuration) {
+					continue;
+				}
+				const configPath = path.join(extension.extensionPath, language.configuration);
+				const pattern = HighlightController.getWordPatternFromConfig(configPath);
+				if (pattern) {
+					return pattern;
+				}
+			}
+		}
+		return null;
+	}
+
+	private static getWordPatternFromConfig(configPath: string): RegExp | null {
+		if (HighlightController.configWordPatternCache.has(configPath)) {
+			return HighlightController.configWordPatternCache.get(configPath) ?? null;
+		}
+
+		try {
+			if (!fs.existsSync(configPath)) {
+				HighlightController.configWordPatternCache.set(configPath, null);
+				return null;
+			}
+
+			let config: unknown;
+			const lowerPath = configPath.toLowerCase();
+			if (lowerPath.endsWith('.json') || lowerPath.endsWith('.jsonc')) {
+				const raw = fs.readFileSync(configPath, 'utf8');
+				config = JSON.parse(HighlightController.stripJsonComments(raw));
+			} else {
+				// eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-unsafe-assignment, global-require
+				const required = require(configPath);
+				config = (required as { default?: unknown })?.default ?? required;
+			}
+
+			const pattern = HighlightController.extractWordPattern(config);
+			HighlightController.configWordPatternCache.set(configPath, pattern ?? null);
+			return pattern ?? null;
+		} catch (error) {
+			console.warn(`[Smart Highlights] Failed to read wordPattern from ${configPath}:`, error);
+			HighlightController.configWordPatternCache.set(configPath, null);
+			return null;
+		}
+	}
+
+	private static extractWordPattern(config: unknown): RegExp | null {
+		if (!config || typeof config !== 'object') {
+			return null;
+		}
+		const rawPattern = (config as { wordPattern?: unknown }).wordPattern;
+		if (!rawPattern) {
+			return null;
+		}
+		if (typeof rawPattern === 'string') {
+			return new RegExp(rawPattern);
+		}
+		if (typeof rawPattern === 'object') {
+			const pattern = (rawPattern as { pattern?: unknown }).pattern;
+			if (typeof pattern === 'string') {
+				const flags = typeof (rawPattern as { flags?: unknown }).flags === 'string' ? (rawPattern as { flags: string }).flags : '';
+				return new RegExp(pattern, flags);
+			}
+		}
+		return null;
+	}
+
+	private static stripJsonComments(content: string): string {
+		let output = '';
+		let inString = false;
+		let stringDelimiter: string | null = null;
+		let inLineComment = false;
+		let inBlockComment = false;
+
+		for (let i = 0; i < content.length; i += 1) {
+			const char = content[i];
+			const next = content[i + 1];
+
+			if (inLineComment) {
+				if (char === '\n') {
+					inLineComment = false;
+					output += char;
+				}
+				continue;
+			}
+
+			if (inBlockComment) {
+				if (char === '*' && next === '/') {
+					inBlockComment = false;
+					i += 1;
+				}
+				continue;
+			}
+
+			if (inString) {
+				if (char === '\\') {
+					output += char;
+					i += 1;
+					if (i < content.length) {
+						output += content[i];
+					}
+					continue;
+				}
+
+				if (char === stringDelimiter) {
+					inString = false;
+					stringDelimiter = null;
+				}
+
+				output += char;
+				continue;
+			}
+
+			if (char === '"' || char === "'" || char === '`') {
+				inString = true;
+				stringDelimiter = char;
+				output += char;
+				continue;
+			}
+
+			if (char === '/' && next === '/') {
+				inLineComment = true;
+				i += 1;
+				continue;
+			}
+
+			if (char === '/' && next === '*') {
+				inBlockComment = true;
+				i += 1;
+				continue;
+			}
+
+			output += char;
+		}
+
+		return output;
 	}
 
 	private static getReadableTextColor(color: string): string | undefined {
@@ -1152,7 +1465,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 
 				const matchBadge = document.createElement('div');
 				matchBadge.className = 'match-count';
-				updateMatchBadge(matchBadge, rule.matchCount);
+				updateMatchBadge(matchBadge, rule.matchCount, rule.currentMatchIndex);
 				secondRow.appendChild(matchBadge);
 
 				main.appendChild(primaryRow);
@@ -1173,15 +1486,24 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			element.style.color = contrast || '';
 		}
 
-		function updateMatchBadge(element, count) {
+		function updateMatchBadge(element, total, currentIndex) {
 			if (!(element instanceof HTMLElement)) {
 				return;
 			}
-			const numeric = Number.isFinite(count) ? Number(count) : 0;
-			element.textContent = numeric.toString();
-			element.title = numeric === 1 ? '1 hit' : numeric + ' hits';
-			element.classList.toggle('has-matches', numeric > 0);
-			element.classList.toggle('empty', numeric === 0);
+			const totalCount = Number.isFinite(total) ? Number(total) : 0;
+			const current =
+				typeof currentIndex === 'number' && Number.isFinite(currentIndex) ? Math.trunc(currentIndex) : null;
+			const withinRange = current !== null && current > 0 && current <= Math.max(totalCount, 1);
+
+			if (withinRange && totalCount > 0) {
+				element.textContent = current + ' / ' + totalCount;
+				element.title = 'Match ' + current + ' of ' + totalCount;
+			} else {
+				element.textContent = totalCount.toString();
+				element.title = totalCount === 1 ? '1 hit' : totalCount + ' hits';
+			}
+			element.classList.toggle('has-matches', totalCount > 0);
+			element.classList.toggle('empty', totalCount === 0);
 		}
 
 		function getContrastColor(color) {
