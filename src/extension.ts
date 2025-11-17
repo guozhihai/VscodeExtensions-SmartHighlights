@@ -4,6 +4,7 @@ import * as path from 'path';
 
 type NavigationDirection = 'next' | 'previous';
 type RuleOptionKey = 'matchCase' | 'matchWholeWord' | 'useRegex';
+type RuleScope = 'document' | 'folder' | 'folderRecursive';
 
 interface CreateRulePayload {
 	documentUri: string;
@@ -12,6 +13,8 @@ interface CreateRulePayload {
 	matchCase: boolean;
 	matchWholeWord: boolean;
 	useRegex: boolean;
+	scope?: RuleScope;
+	fileFilter?: string;
 }
 
 interface HighlightRule {
@@ -22,25 +25,108 @@ interface HighlightRule {
 	matchWholeWord: boolean;
 	useRegex: boolean;
 	decoration: vscode.TextEditorDecorationType;
-	documentUri: string;
+	scope: RuleScope;
+	targetUri: string;
+	statsByDocument: Map<string, DocumentRuleStats>;
+	globalMatchIndex: number | null;
+	fileFilter?: string;
+	filterMatchers: RegExp[] | null;
+}
+
+interface DocumentRuleStats {
 	matchCount: number;
 	currentMatchIndex: number | null;
 	ranges: vscode.Range[];
 }
 
-interface PanelRule extends Omit<HighlightRule, 'decoration' | 'ranges'> {
+interface RuleMatchLocation {
+	uri: string;
+	range: vscode.Range;
+}
+
+interface PanelRule {
+	id: string;
+	pattern: string;
+	color: string;
+	matchCase: boolean;
+	matchWholeWord: boolean;
+	useRegex: boolean;
+	documentUri: string;
+	scope: RuleScope;
+	targetUri: string;
+	fileFilter?: string;
+	matchCount: number;
+	currentMatchIndex: number | null;
+	documentMatchCount: number;
+	documentMatchIndex: number | null;
 	description: string;
 }
 
 type RuleMap = Map<string, HighlightRule[]>;
 
+interface ScopeInfo {
+	scope: RuleScope;
+	targetUri: string;
+	key: string;
+}
+
+interface ScopeOptionDetails extends ScopeInfo {
+	label: string;
+	description: string;
+}
+
+interface ScopeSelectionData {
+	options: ScopeOptionDetails[];
+	defaultScope: RuleScope | null;
+}
+
+interface ScopeQuickPickItem extends vscode.QuickPickItem {
+	scope: RuleScope;
+}
+
+interface ScopeOptionPickItem extends vscode.QuickPickItem {
+	option: ScopeOptionDetails;
+}
+
 class HighlightController {
-	private readonly rulesByDocument: RuleMap = new Map();
+	private readonly rulesByScope: RuleMap = new Map();
+	private readonly ruleIndex = new Map<string, HighlightRule>();
+	private readonly documentRuleIds = new Map<string, Set<string>>();
+	private readonly pendingScopeScans = new Map<string, Promise<void>>();
+	private readonly pendingScopeRescanRuleIds = new Set<string>();
 	private readonly onDidChangeRulesEmitter = new vscode.EventEmitter<void>();
 	private static readonly defaultWordSeparators = `~!@#$%^&*()-=+[{]}\\|;:'",.<>/?`;
+	private static readonly LOG_PREFIX = '[Smart Highlights]';
+	private static readonly DEBUG_LOGGING_ENABLED = process.env.CONDITIONAL_COLORING_DEBUG !== '0';
 	private static readonly wordSeparatorCache = new Map<string, Set<string>>();
 	private static readonly wordPatternCache = new Map<string, RegExp | null>();
 	private static readonly configWordPatternCache = new Map<string, RegExp | null>();
+	private static readonly SCOPE_SCAN_EXCLUDES = ['**/node_modules/**', '**/.git/**', '**/out/**', '**/dist/**', '**/build/**'];
+	private static readonly SCOPE_SCAN_MAX_FILES = 2000;
+
+	private static getScopeCreationMessage(scope: RuleScope): string {
+		switch (scope) {
+			case 'folder':
+				return 'Highlight added for this folder.';
+			case 'folderRecursive':
+				return 'Highlight added for this folder and its subfolders.';
+			case 'document':
+			default:
+				return 'Highlight added to the current file.';
+		}
+	}
+
+	private static describeScope(scope: RuleScope): string {
+		switch (scope) {
+			case 'folder':
+				return 'Folder only';
+			case 'folderRecursive':
+				return 'Folder + subfolders';
+			case 'document':
+			default:
+				return 'File only';
+		}
+	}
 
 	public readonly onDidChangeRules = this.onDidChangeRulesEmitter.event;
 
@@ -49,7 +135,7 @@ class HighlightController {
 			this.onDidChangeRulesEmitter,
 			vscode.workspace.onDidChangeTextDocument((event) => {
 				const uri = event.document.uri.toString();
-				if (this.rulesByDocument.has(uri)) {
+				if (this.hasRulesForDocument(event.document)) {
 					this.updateDecorationsForUri(uri);
 					this.notifyRulesChanged();
 				}
@@ -66,14 +152,7 @@ class HighlightController {
 			}),
 			vscode.workspace.onDidCloseTextDocument((document) => {
 				const uri = document.uri.toString();
-				const rules = this.rulesByDocument.get(uri);
-				if (!rules) {
-					return;
-				}
-
-				for (const rule of rules) {
-					this.clearRuleDecorations(uri, rule);
-				}
+				this.clearDocumentState(uri);
 			})
 		);
 	}
@@ -123,16 +202,26 @@ class HighlightController {
 			return;
 		}
 
-		const success = this.createRuleFromOptions(editor, {
-			pattern,
-			color,
-			matchCase: options?.some((option) => option.option === 'matchCase') ?? false,
-			matchWholeWord: options?.some((option) => option.option === 'matchWholeWord') ?? false,
-			useRegex: options?.some((option) => option.option === 'useRegex') ?? false,
-		});
+		const scope = await this.pickScopeForNewRule(editor.document);
+		if (!scope) {
+			return;
+		}
 
-		if (success) {
-			void vscode.window.showInformationMessage('Highlight added to the current file.');
+		const createdRule = this.createRuleFromOptions(
+			editor,
+			{
+				pattern,
+				color,
+				matchCase: options?.some((option) => option.option === 'matchCase') ?? false,
+				matchWholeWord: options?.some((option) => option.option === 'matchWholeWord') ?? false,
+				useRegex: options?.some((option) => option.option === 'useRegex') ?? false,
+				fileFilter: undefined,
+			},
+			scope
+		);
+
+		if (createdRule) {
+			void vscode.window.showInformationMessage(HighlightController.getScopeCreationMessage(createdRule.scope));
 		}
 	}
 
@@ -143,8 +232,7 @@ class HighlightController {
 			return;
 		}
 
-		const uri = editor.document.uri.toString();
-		const rules = this.rulesByDocument.get(uri);
+		const rules = this.getRulesForDocument(editor.document);
 
 		if (!rules || rules.length === 0) {
 			void vscode.window.showInformationMessage('No highlights exist for the current file.');
@@ -155,7 +243,7 @@ class HighlightController {
 			rules.map((rule) => ({
 				label: rule.pattern,
 				description: this.describeRule(rule),
-				detail: `Color: ${rule.color}`,
+				detail: `${HighlightController.describeScope(rule.scope)} - Color: ${rule.color}`,
 				rule,
 			})),
 			{
@@ -168,7 +256,7 @@ class HighlightController {
 			return;
 		}
 
-		if (this.removeRule(uri, pick.rule.id)) {
+		if (this.removeRuleByInstance(pick.rule)) {
 			this.notifyRulesChanged();
 			void vscode.window.showInformationMessage('Highlight removed.');
 		}
@@ -181,20 +269,24 @@ class HighlightController {
 			return;
 		}
 
-		const uri = editor.document.uri.toString();
-		const rules = this.rulesByDocument.get(uri);
-		if (!rules || rules.length === 0) {
+		const scopeOption = await this.pickScopeForClearing(editor.document);
+		if (!scopeOption) {
 			void vscode.window.showInformationMessage('There are no highlights to clear.');
 			return;
 		}
 
-		for (const rule of rules) {
-			this.clearRuleDecorations(uri, rule);
-			rule.decoration.dispose();
+		const rules = this.rulesByScope.get(scopeOption.key) ?? [];
+		for (const rule of [...rules]) {
+			this.removeRuleByInstance(rule);
 		}
-		this.rulesByDocument.delete(uri);
 		this.notifyRulesChanged();
-		void vscode.window.showInformationMessage('All highlights cleared for this file.');
+		const targetType =
+			scopeOption.scope === 'folderRecursive'
+				? 'folder and subfolders'
+				: scopeOption.scope === 'folder'
+					? 'folder'
+					: 'file';
+		void vscode.window.showInformationMessage(`All highlights cleared for this ${targetType}.`);
 	}
 
 	public getRuleSnapshots(uri?: string | null): PanelRule[] {
@@ -202,20 +294,33 @@ class HighlightController {
 			return [];
 		}
 
-		const rules = this.rulesByDocument.get(uri) ?? [];
+		const targetUri = vscode.Uri.parse(uri);
+		const rules = this.getRulesForUri(targetUri);
 		return rules.map((rule) => {
-			const { decoration: _decoration, ranges: _ranges, ...rest } = rule;
+			const stats = rule.statsByDocument.get(uri);
+			const totalMatches = this.getTotalMatchCount(rule);
 			return {
-				...rest,
-				matchCount: rule.matchCount ?? 0,
-				currentMatchIndex: rule.currentMatchIndex ?? null,
+				id: rule.id,
+				pattern: rule.pattern,
+				color: rule.color,
+				matchCase: rule.matchCase,
+				matchWholeWord: rule.matchWholeWord,
+				useRegex: rule.useRegex,
+				matchCount: totalMatches,
+				currentMatchIndex: rule.globalMatchIndex ?? null,
+				documentMatchCount: stats?.matchCount ?? 0,
+				documentMatchIndex: stats?.currentMatchIndex ?? null,
+				scope: rule.scope,
+				targetUri: rule.targetUri,
+				fileFilter: rule.fileFilter,
+				documentUri: uri,
 				description: this.describeRule(rule),
 			};
 		});
 	}
 
-	public updateRulePattern(uri: string, ruleId: string, pattern: string): boolean {
-		const rule = this.getRule(uri, ruleId);
+	public updateRulePattern(ruleId: string, pattern: string): boolean {
+		const rule = this.ruleIndex.get(ruleId);
 		if (!rule) {
 			return false;
 		}
@@ -235,13 +340,14 @@ class HighlightController {
 		}
 
 		rule.pattern = trimmed;
-		this.updateDecorationsForUri(uri);
+		this.scheduleScopeScan(rule);
+		this.refreshEditorsForRule(rule);
 		this.notifyRulesChanged();
 		return true;
 	}
 
-	public toggleRuleOption(uri: string, ruleId: string, option: RuleOptionKey) {
-		const rule = this.getRule(uri, ruleId);
+	public toggleRuleOption(ruleId: string, option: RuleOptionKey) {
+		const rule = this.ruleIndex.get(ruleId);
 		if (!rule) {
 			return;
 		}
@@ -260,12 +366,43 @@ class HighlightController {
 			}
 		}
 
-		this.updateDecorationsForUri(uri);
+		this.refreshEditorsForRule(rule);
+		this.scheduleScopeScan(rule);
 		this.notifyRulesChanged();
 	}
 
-	public updateRuleColor(uri: string, ruleId: string, color: string): boolean {
-		const rule = this.getRule(uri, ruleId);
+	public async changeRuleScope(ruleId: string, scope: RuleScope, documentUri: string): Promise<boolean> {
+		const rule = this.ruleIndex.get(ruleId);
+		if (!rule) {
+			return false;
+		}
+		if (!documentUri) {
+			return false;
+		}
+		try {
+			const uri = vscode.Uri.parse(documentUri);
+			const document =
+				vscode.workspace.textDocuments.find((doc) => doc.uri.toString() === documentUri) ??
+				(await vscode.workspace.openTextDocument(uri));
+			const scopeInfo = this.resolveScopeForDocument(document, scope);
+			if (scopeInfo.scope === rule.scope && scopeInfo.targetUri === rule.targetUri) {
+				return false;
+			}
+			this.moveRuleToScope(rule, scopeInfo);
+			this.clearRuleFromAllDocuments(rule);
+			this.scheduleScopeScan(rule);
+			this.refreshEditorsForScope(rule.scope, rule.targetUri);
+			this.notifyRulesChanged();
+			return true;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.warn(`${HighlightController.LOG_PREFIX} Failed to change rule scope`, { ruleId, message });
+			return false;
+		}
+	}
+
+	public updateRuleColor(ruleId: string, color: string): boolean {
+		const rule = this.ruleIndex.get(ruleId);
 		if (!rule) {
 			return false;
 		}
@@ -279,57 +416,83 @@ class HighlightController {
 		rule.decoration.dispose();
 		rule.color = trimmed;
 		rule.decoration = HighlightController.createDecoration(trimmed);
-		this.updateDecorationsForUri(uri);
+		this.refreshEditorsForRule(rule);
 		this.notifyRulesChanged();
 		return true;
 	}
 
-	public deleteRule(uri: string, ruleId: string): boolean {
-		const removed = this.removeRule(uri, ruleId);
+	public deleteRule(ruleId: string): boolean {
+		const removed = this.removeRuleById(ruleId);
 		if (removed) {
 			this.notifyRulesChanged();
 		}
 		return removed;
 	}
 
-	public navigateToMatch(uri: string, ruleId: string, direction: NavigationDirection) {
-		const editor = vscode.window.activeTextEditor;
-		if (!editor || editor.document.uri.toString() !== uri) {
-			void vscode.window.showInformationMessage('Open the target document to navigate between matches.');
-			return;
-		}
-
-		const rule = this.getRule(uri, ruleId);
+	public async navigateToMatch(uri: string, ruleId: string, direction: NavigationDirection) {
+		const rule = this.ruleIndex.get(ruleId);
 		if (!rule) {
 			return;
 		}
 
-		const matches = this.findMatches(editor.document, rule);
-		rule.matchCount = matches.length;
-		rule.ranges = matches;
+		await this.ensureScopeScan(rule);
+		const matches = this.getOrderedMatches(rule);
 		if (matches.length === 0) {
 			void vscode.window.showInformationMessage(`No matches were found for "${rule.pattern}".`);
 			return;
 		}
 
-		const doc = editor.document;
-		const selection = editor.selection;
-		const anchorOffset = doc.offsetAt(selection.anchor);
-		const activeOffset = doc.offsetAt(selection.active);
-		const currentStart = Math.min(anchorOffset, activeOffset);
-		const currentEnd = Math.max(anchorOffset, activeOffset);
-		let target: vscode.Range;
-
-		if (direction === 'next') {
-			target = matches.find((range) => doc.offsetAt(range.start) > currentEnd) ?? matches[0];
-		} else {
-			target =
-				[...matches].reverse().find((range) => doc.offsetAt(range.end) < currentStart) ??
-				matches[matches.length - 1];
+		const activeEditor = vscode.window.activeTextEditor;
+		let currentIndex: number | null = null;
+		if (activeEditor) {
+			const activeUri = activeEditor.document.uri.toString();
+			const stats = rule.statsByDocument.get(activeUri);
+			if (stats) {
+				const localIndex = HighlightController.computeSelectionMatchIndex(
+					activeEditor.selection,
+					stats.ranges,
+					activeEditor.document
+				);
+				const globalIndex = this.computeGlobalMatchIndex(rule, activeUri, localIndex);
+				if (globalIndex && globalIndex > 0) {
+					currentIndex = globalIndex - 1;
+				}
+			}
 		}
 
-		editor.selection = new vscode.Selection(target.start, target.end);
-		editor.revealRange(target, vscode.TextEditorRevealType.InCenter);
+		if (currentIndex === null && uri) {
+			const stats = rule.statsByDocument.get(uri);
+			const localIndex = stats?.currentMatchIndex ?? null;
+			const globalIndex = this.computeGlobalMatchIndex(rule, uri, localIndex);
+			if (globalIndex && globalIndex > 0) {
+				currentIndex = globalIndex - 1;
+			}
+		}
+
+		if (currentIndex === null && typeof rule.globalMatchIndex === 'number' && rule.globalMatchIndex > 0) {
+			currentIndex = rule.globalMatchIndex - 1;
+		}
+
+		let targetIndex: number;
+		if (direction === 'next') {
+			targetIndex = currentIndex === null ? 0 : (currentIndex + 1) % matches.length;
+		} else {
+			targetIndex = currentIndex === null ? matches.length - 1 : (currentIndex - 1 + matches.length) % matches.length;
+		}
+
+		const target = matches[targetIndex];
+		const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(target.uri));
+		const editor = await vscode.window.showTextDocument(document, { preview: false });
+		this.applyRules(editor);
+		editor.selection = new vscode.Selection(target.range.start, target.range.end);
+		editor.revealRange(target.range, vscode.TextEditorRevealType.InCenter);
+
+		const localIndex = this.getLocalIndexForMatch(rule, target.uri, target.range);
+		const stats = this.getOrCreateStats(rule, target.uri);
+		stats.currentMatchIndex = localIndex;
+		rule.globalMatchIndex = targetIndex + 1;
+
+		this.notifyRulesChanged();
 	}
 
 	public async createRuleFromPayload(payload: CreateRulePayload) {
@@ -353,36 +516,43 @@ class HighlightController {
 			vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === payload.documentUri) ??
 			(await vscode.window.showTextDocument(document));
 
-		const created = this.createRuleFromOptions(editor, {
-			pattern: trimmedPattern,
-			color: trimmedColor,
-			matchCase: payload.matchCase,
-			matchWholeWord: payload.matchWholeWord,
-			useRegex: payload.useRegex,
-		});
+		const createdRule = this.createRuleFromOptions(
+			editor,
+			{
+				pattern: trimmedPattern,
+				color: trimmedColor,
+				matchCase: payload.matchCase,
+				matchWholeWord: payload.matchWholeWord,
+				useRegex: payload.useRegex,
+				fileFilter: payload.fileFilter,
+			},
+			payload.scope
+		);
 
-		if (created) {
-			void vscode.window.showInformationMessage('Highlight added to the current file.');
+		if (createdRule) {
+			void vscode.window.showInformationMessage(HighlightController.getScopeCreationMessage(createdRule.scope));
 		}
 	}
 
 	private createRuleFromOptions(
 		editor: vscode.TextEditor,
-		options: Omit<CreateRulePayload, 'documentUri'>
-	): boolean {
+		options: Omit<CreateRulePayload, 'documentUri' | 'scope'>,
+		scope?: RuleScope
+	): HighlightRule | null {
 		const pattern = options.pattern.trim();
 		if (!pattern) {
 			void vscode.window.showErrorMessage('Enter a value to highlight.');
-			return false;
+			return null;
 		}
 
 		const color = options.color.trim();
 		if (!color) {
 			void vscode.window.showErrorMessage('Pick a highlight color.');
-			return false;
+			return null;
 		}
 
-		const uri = editor.document.uri.toString();
+		const normalizedFilter = HighlightController.normalizeFileFilter(options.fileFilter);
+		const scopeInfo = this.resolveScopeForDocument(editor.document, scope);
 		const rule: HighlightRule = {
 			id: HighlightController.createId(),
 			pattern,
@@ -391,10 +561,12 @@ class HighlightController {
 			matchWholeWord: options.matchWholeWord,
 			useRegex: options.useRegex,
 			decoration: HighlightController.createDecoration(color),
-			documentUri: uri,
-			matchCount: 0,
-			currentMatchIndex: null,
-			ranges: [],
+			scope: scopeInfo.scope,
+			targetUri: scopeInfo.targetUri,
+			statsByDocument: new Map(),
+			globalMatchIndex: null,
+			fileFilter: normalizedFilter,
+			filterMatchers: HighlightController.createFilterMatchers(normalizedFilter),
 		};
 
 		if (rule.useRegex) {
@@ -404,73 +576,173 @@ class HighlightController {
 				rule.decoration.dispose();
 				const message = error instanceof Error ? error.message : String(error);
 				void vscode.window.showErrorMessage(`Invalid regular expression: ${message}`);
-				return false;
+				return null;
 			}
 		}
 
-		const rules = this.rulesByDocument.get(uri) ?? [];
+		const key = scopeInfo.key;
+		const rules = this.rulesByScope.get(key) ?? [];
 		rules.push(rule);
-		this.rulesByDocument.set(uri, rules);
+		this.rulesByScope.set(key, rules);
+		this.ruleIndex.set(rule.id, rule);
+		this.logDebug('Created highlight rule', {
+			ruleId: rule.id,
+			pattern: rule.pattern,
+			scope: rule.scope,
+			targetUri: rule.targetUri,
+			scopeKey: key,
+			totalRulesForKey: rules.length,
+		});
+		this.scheduleScopeScan(rule);
 
-		this.applyRules(editor);
+		this.refreshEditorsForScope(rule.scope, rule.targetUri);
 		this.notifyRulesChanged();
-		return true;
+		return rule;
+	}
+
+	private moveRuleToScope(rule: HighlightRule, scopeInfo: ScopeInfo) {
+		const previousKey = HighlightController.createScopeKey(rule.scope, rule.targetUri);
+		const previousRules = this.rulesByScope.get(previousKey);
+		if (previousRules) {
+			const index = previousRules.findIndex((candidate) => candidate.id === rule.id);
+			if (index !== -1) {
+				previousRules.splice(index, 1);
+			}
+			if (previousRules.length === 0) {
+				this.rulesByScope.delete(previousKey);
+			}
+		}
+
+		rule.scope = scopeInfo.scope;
+		rule.targetUri = scopeInfo.targetUri;
+
+		const nextKey = scopeInfo.key;
+		const nextRules = this.rulesByScope.get(nextKey) ?? [];
+		if (!this.rulesByScope.has(nextKey)) {
+			this.rulesByScope.set(nextKey, nextRules);
+		}
+		nextRules.push(rule);
+
+		this.logDebug('Moved rule to new scope', {
+			ruleId: rule.id,
+			scope: rule.scope,
+			targetUri: rule.targetUri,
+			previousKey,
+			nextKey,
+		});
 	}
 
 	private notifyRulesChanged() {
 		this.onDidChangeRulesEmitter.fire();
 	}
 
-	private getRule(uri: string, ruleId: string): HighlightRule | undefined {
-		const rules = this.rulesByDocument.get(uri);
-		return rules?.find((rule) => rule.id === ruleId);
+	private removeRuleById(ruleId: string): boolean {
+		const rule = this.ruleIndex.get(ruleId);
+		if (!rule) {
+			return false;
+		}
+		return this.removeRuleByInstance(rule);
 	}
 
-	private removeRule(uri: string, ruleId: string): boolean {
-		const rules = this.rulesByDocument.get(uri);
+	private removeRuleByInstance(rule: HighlightRule): boolean {
+		const key = HighlightController.createScopeKey(rule.scope, rule.targetUri);
+		const rules = this.rulesByScope.get(key);
 		if (!rules) {
+			this.logDebug('Attempted to remove rule but scope entry missing', { ruleId: rule.id, scopeKey: key });
 			return false;
 		}
 
-		const index = rules.findIndex((rule) => rule.id === ruleId);
+		const index = rules.findIndex((candidate) => candidate.id === rule.id);
 		if (index === -1) {
+			this.logDebug('Attempted to remove rule not found under key', { ruleId: rule.id, scopeKey: key });
 			return false;
 		}
 
-		const [removed] = rules.splice(index, 1);
-		this.clearRuleDecorations(uri, removed);
-		removed.decoration.dispose();
+		rules.splice(index, 1);
 		if (rules.length === 0) {
-			this.rulesByDocument.delete(uri);
+			this.rulesByScope.delete(key);
 		}
 
-		this.updateDecorationsForUri(uri);
+		this.ruleIndex.delete(rule.id);
+		this.clearRuleFromAllDocuments(rule);
+		rule.decoration.dispose();
+		this.logDebug('Removed highlight rule', {
+			ruleId: rule.id,
+			scope: rule.scope,
+			targetUri: rule.targetUri,
+			scopeKey: key,
+			remainingRulesForKey: rules.length,
+		});
+		this.refreshEditorsForScope(rule.scope, rule.targetUri);
 		return true;
 	}
 
 	private applyRules(editor: vscode.TextEditor) {
-		const uri = editor.document.uri.toString();
-		const rules = this.rulesByDocument.get(uri);
-		if (!rules) {
+		const document = editor.document;
+		const uri = document.uri.toString();
+		const rules = this.getRulesForDocument(document);
+		const previousRuleIds = this.documentRuleIds.get(uri) ?? new Set<string>();
+		const nextRuleIds = new Set<string>();
+
+		this.logDebug('Applying rules to document', {
+			documentUri: uri,
+			ruleCount: rules.length,
+			activeEditor: editor === vscode.window.activeTextEditor,
+		});
+
+		if (rules.length === 0) {
+			for (const ruleId of previousRuleIds) {
+				const rule = this.ruleIndex.get(ruleId);
+				if (rule) {
+					editor.setDecorations(rule.decoration, []);
+					rule.statsByDocument.delete(uri);
+				}
+			}
+			this.documentRuleIds.delete(uri);
 			return;
 		}
 
 		for (const rule of rules) {
-			const ranges = this.findMatches(editor.document, rule);
-			rule.matchCount = ranges.length;
-			rule.ranges = ranges;
+			const ranges = this.findMatches(document, rule);
+			const stats = this.getOrCreateStats(rule, uri);
+			stats.matchCount = ranges.length;
+			stats.ranges = ranges;
 			if (ranges.length === 0) {
-				rule.currentMatchIndex = null;
+				stats.currentMatchIndex = null;
 			} else if (editor === vscode.window.activeTextEditor) {
-				rule.currentMatchIndex = HighlightController.computeSelectionMatchIndex(
+				stats.currentMatchIndex = HighlightController.computeSelectionMatchIndex(
 					editor.selection,
 					ranges,
-					editor.document
+					document
 				);
 			} else {
-				rule.currentMatchIndex = null;
+				stats.currentMatchIndex = null;
 			}
 			editor.setDecorations(rule.decoration, ranges);
+			nextRuleIds.add(rule.id);
+			this.logDebug('Applied individual rule to document', {
+				documentUri: uri,
+				ruleId: rule.id,
+				scope: rule.scope,
+				targetUri: rule.targetUri,
+				matchCount: ranges.length,
+			});
+		}
+
+		for (const ruleId of previousRuleIds) {
+			if (!nextRuleIds.has(ruleId)) {
+				const rule = this.ruleIndex.get(ruleId);
+				if (rule) {
+					editor.setDecorations(rule.decoration, []);
+					rule.statsByDocument.delete(uri);
+				}
+			}
+		}
+
+		if (nextRuleIds.size === 0) {
+			this.documentRuleIds.delete(uri);
+		} else {
+			this.documentRuleIds.set(uri, nextRuleIds);
 		}
 	}
 
@@ -478,9 +750,10 @@ class HighlightController {
 		editor: vscode.TextEditor,
 		selections?: readonly vscode.Selection[]
 	) {
-		const uri = editor.document.uri.toString();
-		const rules = this.rulesByDocument.get(uri);
-		if (!rules || rules.length === 0) {
+		const document = editor.document;
+		const uri = document.uri.toString();
+		const rules = this.getRulesForDocument(document);
+		if (rules.length === 0) {
 			return;
 		}
 
@@ -488,22 +761,26 @@ class HighlightController {
 		let changed = false;
 
 		for (const rule of rules) {
-			if (!rule.ranges) {
-				rule.ranges = [];
-			}
-			if (rule.ranges.length === 0 && rule.matchCount > 0) {
-				const ranges = this.findMatches(editor.document, rule);
-				rule.ranges = ranges;
-				rule.matchCount = ranges.length;
+			const stats = this.getOrCreateStats(rule, uri);
+			if (stats.ranges.length === 0 && stats.matchCount > 0) {
+				const ranges = this.findMatches(document, rule);
+				stats.ranges = ranges;
+				stats.matchCount = ranges.length;
 			}
 
+			const ranges = stats.ranges;
 			const index = HighlightController.computeSelectionMatchIndex(
 				selection,
-				rule.ranges,
-				editor.document
+				ranges,
+				document
 			);
-			if (rule.currentMatchIndex !== index) {
-				rule.currentMatchIndex = index;
+			if (stats.currentMatchIndex !== index) {
+				stats.currentMatchIndex = index;
+				changed = true;
+			}
+			const globalIndex = this.computeGlobalMatchIndex(rule, uri, index);
+			if (rule.globalMatchIndex !== globalIndex) {
+				rule.globalMatchIndex = globalIndex;
 				changed = true;
 			}
 		}
@@ -604,11 +881,605 @@ class HighlightController {
 		return parts.length > 0 ? parts.join(' / ') : 'No options';
 	}
 
-	private clearRuleDecorations(uri: string, rule: HighlightRule) {
-		const editors = vscode.window.visibleTextEditors.filter((editor) => editor.document.uri.toString() === uri);
+	private clearRuleFromAllDocuments(rule: HighlightRule) {
+		for (const documentUri of [...rule.statsByDocument.keys()]) {
+			this.removeRuleFromDocument(rule, documentUri);
+		}
+	}
+
+	private scheduleScopeScan(rule: HighlightRule) {
+		if (rule.scope === 'document') {
+			return;
+		}
+		if (this.pendingScopeScans.has(rule.id)) {
+			this.pendingScopeRescanRuleIds.add(rule.id);
+			return;
+		}
+
+		const promise = this.performScopeScan(rule)
+			.catch((error) => {
+				console.warn(`${HighlightController.LOG_PREFIX} Failed to scan scope`, error);
+			})
+			.finally(() => {
+				this.pendingScopeScans.delete(rule.id);
+				if (this.pendingScopeRescanRuleIds.delete(rule.id)) {
+					this.scheduleScopeScan(rule);
+				}
+			});
+		this.pendingScopeScans.set(rule.id, promise);
+	}
+
+	private async ensureScopeScan(rule: HighlightRule): Promise<void> {
+		if (rule.scope === 'document') {
+			return;
+		}
+		this.scheduleScopeScan(rule);
+		const pending = this.pendingScopeScans.get(rule.id);
+		if (pending) {
+			await pending;
+		}
+	}
+
+	private async performScopeScan(rule: HighlightRule): Promise<void> {
+		const uris = await this.collectUrisForRuleScope(rule);
+		const filteredUris = uris.filter((uri) => this.isFileIncluded(rule, uri));
+		let processed = 0;
+		for (const uri of filteredUris) {
+			await this.scanRuleInUri(rule, uri);
+			processed += 1;
+		}
+		rule.globalMatchIndex = null;
+		this.logDebug('Completed scope scan', {
+			ruleId: rule.id,
+			scope: rule.scope,
+			targetUri: rule.targetUri,
+			filesProcessed: processed,
+		});
+		this.notifyRulesChanged();
+	}
+
+	private static getScopeExcludePattern(): string | undefined {
+		if (HighlightController.SCOPE_SCAN_EXCLUDES.length === 0) {
+			return undefined;
+		}
+		return `{${HighlightController.SCOPE_SCAN_EXCLUDES.join(',')}}`;
+	}
+
+	private async collectUrisForRuleScope(rule: HighlightRule): Promise<vscode.Uri[]> {
+		try {
+			if (rule.scope === 'document') {
+				return [vscode.Uri.parse(rule.targetUri)];
+			}
+
+			const folderUri = vscode.Uri.parse(rule.targetUri);
+			if (rule.scope === 'folder') {
+				return this.readImmediateFiles(folderUri);
+			}
+
+			return this.readRecursiveFiles(folderUri);
+		} catch (error) {
+			this.logDebug('Failed to enumerate files for scope', {
+				ruleId: rule.id,
+				scope: rule.scope,
+				targetUri: rule.targetUri,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return [];
+		}
+	}
+
+	private async readImmediateFiles(folderUri: vscode.Uri): Promise<vscode.Uri[]> {
+		const entries = await vscode.workspace.fs.readDirectory(folderUri);
+		const result: vscode.Uri[] = [];
+		for (const [name, type] of entries) {
+			if (type === vscode.FileType.File) {
+				result.push(vscode.Uri.joinPath(folderUri, name));
+			}
+		}
+		return result;
+	}
+
+	private async readRecursiveFiles(folderUri: vscode.Uri): Promise<vscode.Uri[]> {
+		const exclude = HighlightController.getScopeExcludePattern();
+		const pattern = new vscode.RelativePattern(folderUri, '**/*');
+		return vscode.workspace.findFiles(pattern, exclude, HighlightController.SCOPE_SCAN_MAX_FILES);
+	}
+
+	private async scanRuleInUri(rule: HighlightRule, uri: vscode.Uri): Promise<void> {
+		try {
+			if (!this.isFileIncluded(rule, uri)) {
+				return;
+			}
+			const document = await vscode.workspace.openTextDocument(uri);
+			const ranges = this.findMatches(document, rule);
+			const key = uri.toString();
+			if (ranges.length === 0) {
+				if (rule.statsByDocument.has(key)) {
+					rule.statsByDocument.delete(key);
+				}
+				return;
+			}
+			const stats = this.getOrCreateStats(rule, key);
+			stats.matchCount = ranges.length;
+			stats.ranges = ranges;
+			stats.currentMatchIndex = null;
+		} catch (error) {
+			this.logDebug('Skipped file during scope scan', {
+				ruleId: rule.id,
+				file: uri.toString(),
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	private getTotalMatchCount(rule: HighlightRule): number {
+		let total = 0;
+		for (const stats of rule.statsByDocument.values()) {
+			total += stats.matchCount;
+		}
+		return total;
+	}
+
+	private getOrderedMatches(rule: HighlightRule): RuleMatchLocation[] {
+		const entries = [...rule.statsByDocument.entries()].sort(([uriA], [uriB]) =>
+			uriA.localeCompare(uriB)
+		);
+		const matches: RuleMatchLocation[] = [];
+		for (const [uri, stats] of entries) {
+			const orderedRanges = [...stats.ranges].sort(HighlightController.compareRanges);
+			for (const range of orderedRanges) {
+				matches.push({ uri, range });
+			}
+		}
+		return matches;
+	}
+
+	private computeGlobalMatchIndex(rule: HighlightRule, uri: string, localIndex: number | null): number | null {
+		if (!localIndex || localIndex <= 0) {
+			return null;
+		}
+		const entries = [...rule.statsByDocument.entries()].sort(([uriA], [uriB]) =>
+			uriA.localeCompare(uriB)
+		);
+		let offset = 0;
+		for (const [entryUri, stats] of entries) {
+			if (entryUri === uri) {
+				if (localIndex > stats.matchCount) {
+					return null;
+				}
+				return offset + localIndex;
+			}
+			offset += stats.matchCount;
+		}
+		return null;
+	}
+
+	private static compareRanges(a: vscode.Range, b: vscode.Range): number {
+		if (a.start.line !== b.start.line) {
+			return a.start.line - b.start.line;
+		}
+		if (a.start.character !== b.start.character) {
+			return a.start.character - b.start.character;
+		}
+		if (a.end.line !== b.end.line) {
+			return a.end.line - b.end.line;
+		}
+		return a.end.character - b.end.character;
+	}
+
+	private getLocalIndexForMatch(rule: HighlightRule, uri: string, range: vscode.Range): number | null {
+		const stats = rule.statsByDocument.get(uri);
+		if (!stats) {
+			return null;
+		}
+		const index = stats.ranges.findIndex((candidate) => candidate.isEqual(range));
+		return index === -1 ? null : index + 1;
+	}
+
+	private isFileIncluded(rule: HighlightRule, uri: vscode.Uri): boolean {
+		if (!rule.filterMatchers || rule.filterMatchers.length === 0) {
+			return true;
+		}
+		const fileName = HighlightController.getFileNameForUri(uri);
+		return rule.filterMatchers.some((matcher) => matcher.test(fileName));
+	}
+
+	private removeRuleFromDocument(rule: HighlightRule, documentUri: string) {
+		const editors = vscode.window.visibleTextEditors.filter(
+			(editor) => editor.document.uri.toString() === documentUri
+		);
 		for (const editor of editors) {
 			editor.setDecorations(rule.decoration, []);
 		}
+		rule.statsByDocument.delete(documentUri);
+		const ruleIds = this.documentRuleIds.get(documentUri);
+		if (ruleIds) {
+			ruleIds.delete(rule.id);
+			if (ruleIds.size === 0) {
+				this.documentRuleIds.delete(documentUri);
+			}
+		}
+	}
+
+	private static createScopeKey(scope: RuleScope, targetUri: string): string {
+		return `${scope}:${targetUri}`;
+	}
+
+	private static getContainingFolderUri(uri: vscode.Uri): vscode.Uri | null {
+		if (uri.scheme !== 'file') {
+			return null;
+		}
+		const dir = path.dirname(uri.fsPath);
+		if (!dir || dir === uri.fsPath) {
+			return null;
+		}
+		return vscode.Uri.file(dir);
+	}
+
+	private static getParentFolderUri(folderUri: vscode.Uri): vscode.Uri | null {
+		if (folderUri.scheme !== 'file') {
+			return null;
+		}
+		const parent = path.dirname(folderUri.fsPath);
+		if (!parent || parent === folderUri.fsPath) {
+			return null;
+		}
+		return vscode.Uri.file(parent);
+	}
+
+	private static getFolderHierarchyForUri(uri: vscode.Uri): vscode.Uri[] {
+		const folders: vscode.Uri[] = [];
+		let current = HighlightController.getContainingFolderUri(uri);
+		let safety = 0;
+		while (current && safety < 50) {
+			folders.push(current);
+			current = HighlightController.getParentFolderUri(current);
+			safety += 1;
+		}
+		return folders;
+	}
+
+	private static normalizeUriForComparison(uri: vscode.Uri): string {
+		if (uri.scheme === 'file') {
+			const normalized = path.resolve(uri.fsPath);
+			return normalized.replace(/\\/g, '/').toLowerCase();
+		}
+		return uri.toString().toLowerCase();
+	}
+
+	private static areUrisEqual(a: vscode.Uri, b: vscode.Uri): boolean {
+		return HighlightController.normalizeUriForComparison(a) === HighlightController.normalizeUriForComparison(b);
+	}
+
+	private static isDescendantUri(candidate: vscode.Uri, folder: vscode.Uri): boolean {
+		const candidatePath = HighlightController.normalizeUriForComparison(candidate);
+		const folderPath = HighlightController.normalizeUriForComparison(folder).replace(/\/+$/, '');
+		if (candidatePath === folderPath) {
+			return true;
+		}
+		return candidatePath.startsWith(folderPath + '/');
+	}
+
+	private static getFolderLabel(folderUri: vscode.Uri): string {
+		if (folderUri.scheme !== 'file') {
+			return folderUri.toString();
+		}
+		const base = path.basename(folderUri.fsPath);
+		return base || folderUri.fsPath;
+	}
+
+	private static normalizeFileFilter(value?: string): string | undefined {
+		if (!value) {
+			return undefined;
+		}
+		const normalized = value
+			.split('|')
+			.map((part) => part.trim())
+			.filter((part) => part.length > 0)
+			.join('|');
+		return normalized || undefined;
+	}
+
+	private static createFilterMatchers(value?: string): RegExp[] | null {
+		if (!value) {
+			return null;
+		}
+		const patterns = value
+			.split('|')
+			.map((part) => part.trim())
+			.filter((part) => part.length > 0);
+		if (patterns.length === 0) {
+			return null;
+		}
+		const matchers: RegExp[] = [];
+		for (const pattern of patterns) {
+			const regex = HighlightController.globToRegExp(pattern);
+			if (regex) {
+				matchers.push(regex);
+			}
+		}
+		return matchers.length > 0 ? matchers : null;
+	}
+
+	private static globToRegExp(pattern: string): RegExp | null {
+		const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+		const source = '^' + escaped.replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
+		try {
+			return new RegExp(source, 'i');
+		} catch {
+			return null;
+		}
+	}
+
+	private static getFileNameForUri(uri: vscode.Uri): string {
+		if (uri.scheme === 'file') {
+			return path.basename(uri.fsPath);
+		}
+		const segments = uri.path.split('/');
+		return segments[segments.length - 1] || uri.path || uri.toString();
+	}
+
+	private resolveScopeForDocument(document: vscode.TextDocument, preferredScope?: RuleScope): ScopeInfo {
+		const documentTarget = document.uri.toString();
+		const documentInfo: ScopeInfo = {
+			scope: 'document',
+			targetUri: documentTarget,
+			key: HighlightController.createScopeKey('document', documentTarget),
+		};
+
+		const folderUri = HighlightController.getContainingFolderUri(document.uri);
+		const folderInfo: ScopeInfo | null = folderUri
+			? {
+					scope: 'folder',
+					targetUri: folderUri.toString(),
+					key: HighlightController.createScopeKey('folder', folderUri.toString()),
+			  }
+			: null;
+
+		const folderRecursiveInfo: ScopeInfo | null = folderUri
+			? {
+					scope: 'folderRecursive',
+					targetUri: folderUri.toString(),
+					key: HighlightController.createScopeKey('folderRecursive', folderUri.toString()),
+			  }
+			: null;
+
+		const resolvePreferred = (scope: RuleScope): ScopeInfo => {
+			switch (scope) {
+				case 'folderRecursive':
+					if (folderRecursiveInfo) {
+						return folderRecursiveInfo;
+					}
+					break;
+				case 'folder':
+					if (folderInfo) {
+						return folderInfo;
+					}
+					break;
+				case 'document':
+				default:
+					return documentInfo;
+			}
+			return documentInfo;
+		};
+
+		if (preferredScope) {
+			return resolvePreferred(preferredScope);
+		}
+
+		if (folderRecursiveInfo) {
+			return folderRecursiveInfo;
+		}
+
+		return documentInfo;
+	}
+
+	private getScopeOptionsForDocument(document: vscode.TextDocument): ScopeOptionDetails[] {
+		const options: ScopeOptionDetails[] = [];
+		const documentInfo = this.resolveScopeForDocument(document, 'document');
+		options.push({
+			...documentInfo,
+			label: 'Current File',
+			description: path.basename(document.fileName),
+		});
+
+		const folderUri = HighlightController.getContainingFolderUri(document.uri);
+		if (folderUri) {
+			const folderInfo = this.resolveScopeForDocument(document, 'folder');
+			options.push({
+				...folderInfo,
+				label: 'Current Folder',
+				description: HighlightController.getFolderLabel(folderUri),
+			});
+			const folderRecursiveInfo = this.resolveScopeForDocument(document, 'folderRecursive');
+			options.push({
+				...folderRecursiveInfo,
+				label: 'Folder + Subfolders',
+				description: HighlightController.getFolderLabel(folderUri),
+			});
+		}
+
+		return options;
+	}
+
+	public getScopeSelectionData(document?: vscode.TextDocument | null): ScopeSelectionData {
+		if (!document) {
+			return { options: [], defaultScope: null };
+		}
+		const options = this.getScopeOptionsForDocument(document);
+		const defaultScope = this.resolveScopeForDocument(document).scope;
+		return { options, defaultScope };
+	}
+
+	private async pickScopeForNewRule(document: vscode.TextDocument): Promise<RuleScope | undefined> {
+		const options = this.getScopeOptionsForDocument(document);
+		if (options.length === 0) {
+			return undefined;
+		}
+		if (options.length === 1) {
+			return options[0].scope;
+		}
+		const defaultScope = this.resolveScopeForDocument(document).scope;
+		const selection = await vscode.window.showQuickPick(
+			options.map<ScopeQuickPickItem>((option) => ({
+				label: option.label,
+				description: option.description,
+				scope: option.scope,
+				picked: option.scope === defaultScope,
+			})),
+			{
+				placeHolder: 'Choose where this highlight should apply',
+				ignoreFocusOut: true,
+			}
+		);
+		return selection?.scope;
+	}
+
+	private async pickScopeForClearing(document: vscode.TextDocument): Promise<ScopeOptionDetails | null> {
+		const options = this.getScopeOptionsForDocument(document);
+		const withRules = options
+			.map((option) => ({
+				option,
+				count: this.rulesByScope.get(option.key)?.length ?? 0,
+			}))
+			.filter((entry) => entry.count > 0);
+
+		if (withRules.length === 0) {
+			return null;
+		}
+
+		if (withRules.length === 1) {
+			return withRules[0].option;
+		}
+
+		const selection = await vscode.window.showQuickPick(
+			withRules.map<ScopeOptionPickItem>((entry) => ({
+				label: entry.option.label,
+				description: `${entry.option.description} (${entry.count} rules)`,
+				option: entry.option,
+			})),
+			{
+				placeHolder: 'Select which scope to clear',
+				ignoreFocusOut: true,
+			}
+		);
+
+		return selection?.option ?? null;
+	}
+
+	private getScopeKeysForUri(uri: vscode.Uri): string[] {
+		const keys: string[] = [];
+		keys.push(HighlightController.createScopeKey('document', uri.toString()));
+		const folders = HighlightController.getFolderHierarchyForUri(uri);
+		if (folders.length > 0) {
+			const immediate = folders[0];
+			keys.push(HighlightController.createScopeKey('folder', immediate.toString()));
+			for (const folder of folders) {
+				keys.push(HighlightController.createScopeKey('folderRecursive', folder.toString()));
+			}
+		}
+		return keys;
+	}
+
+	private getRulesForUri(uri: vscode.Uri): HighlightRule[] {
+		const keys = this.getScopeKeysForUri(uri);
+		const result: HighlightRule[] = [];
+		const countsByKey: Record<string, number> = {};
+		for (const key of keys) {
+			const rules = this.rulesByScope.get(key);
+			countsByKey[key] = rules?.length ?? 0;
+			if (rules && rules.length > 0) {
+				result.push(...rules);
+			}
+		}
+		const filtered = result.filter((rule) => this.isFileIncluded(rule, uri));
+		this.logDebug('Resolved rules for URI', {
+			documentUri: uri.toString(),
+			scopeKeys: keys,
+			countsByKey,
+			totalRules: filtered.length,
+		});
+		return filtered;
+	}
+
+	private getRulesForDocument(document: vscode.TextDocument): HighlightRule[] {
+		return this.getRulesForUri(document.uri);
+	}
+
+	private hasRulesForDocument(document: vscode.TextDocument): boolean {
+		return this.getRulesForDocument(document).length > 0;
+	}
+
+	private getOrCreateStats(rule: HighlightRule, documentUri: string): DocumentRuleStats {
+		let stats = rule.statsByDocument.get(documentUri);
+		if (!stats) {
+			stats = { matchCount: 0, currentMatchIndex: null, ranges: [] };
+			rule.statsByDocument.set(documentUri, stats);
+		}
+		return stats;
+	}
+
+	private refreshEditorsForRule(rule: HighlightRule) {
+		this.refreshEditorsForScope(rule.scope, rule.targetUri);
+	}
+
+	private refreshEditorsForScope(scope: RuleScope, targetUri: string) {
+		this.logDebug('Refreshing editors for scope', {
+			scope,
+			targetUri,
+			visibleEditors: vscode.window.visibleTextEditors.map((editor) => editor.document.uri.toString()),
+		});
+		for (const editor of vscode.window.visibleTextEditors) {
+			if (this.doesScopeApplyToDocument(scope, targetUri, editor.document)) {
+				this.applyRules(editor);
+			}
+		}
+	}
+
+	private doesScopeApplyToDocument(scope: RuleScope, targetUri: string, document: vscode.TextDocument): boolean {
+		if (scope === 'document') {
+			return document.uri.toString() === targetUri;
+		}
+		const folderUri = HighlightController.getContainingFolderUri(document.uri);
+		if (!folderUri) {
+			return false;
+		}
+		const target = vscode.Uri.parse(targetUri);
+		if (scope === 'folder') {
+			return HighlightController.areUrisEqual(folderUri, target);
+		}
+		if (scope === 'folderRecursive') {
+			return HighlightController.isDescendantUri(folderUri, target);
+		}
+		return false;
+	}
+
+	private clearDocumentState(documentUri: string) {
+		const appliedRuleIds = this.documentRuleIds.get(documentUri);
+		if (!appliedRuleIds || appliedRuleIds.size === 0) {
+			return;
+		}
+		const editors = vscode.window.visibleTextEditors.filter(
+			(editor) => editor.document.uri.toString() === documentUri
+		);
+		for (const ruleId of appliedRuleIds) {
+			const rule = this.ruleIndex.get(ruleId);
+			if (!rule) {
+				continue;
+			}
+			if (rule.scope === 'document') {
+				rule.statsByDocument.delete(documentUri);
+			} else {
+				const stats = rule.statsByDocument.get(documentUri);
+				if (stats) {
+					stats.currentMatchIndex = null;
+				}
+			}
+			for (const editor of editors) {
+				editor.setDecorations(rule.decoration, []);
+			}
+		}
+		this.documentRuleIds.delete(documentUri);
 	}
 
 	private static createDecoration(color: string): vscode.TextEditorDecorationType {
@@ -842,6 +1713,17 @@ class HighlightController {
 		return luminance > 0.6 ? '#1f1f1f' : '#ffffff';
 	}
 
+	private logDebug(message: string, data?: Record<string, unknown>) {
+		if (!HighlightController.DEBUG_LOGGING_ENABLED) {
+			return;
+		}
+		if (data) {
+			console.log(`${HighlightController.LOG_PREFIX} ${message}`, data);
+		} else {
+			console.log(`${HighlightController.LOG_PREFIX} ${message}`);
+		}
+	}
+
 	private static parseHexColor(value: string): { r: number; g: number; b: number } | undefined {
 		const trimmed = value.trim();
 		if (!trimmed.startsWith('#')) {
@@ -882,14 +1764,19 @@ type PanelMessage =
 	| (PanelMessageBase & { type: 'requestData' })
 	| (PanelMessageBase & { type: 'addRule' })
 	| (PanelMessageBase & { type: 'createRule'; payload: CreateRulePayload })
-	| (PanelMessageBase & { type: 'removeRule'; ruleId: string; documentUri: string })
-	| (PanelMessageBase & { type: 'updatePattern'; ruleId: string; documentUri: string; pattern: string })
-	| (PanelMessageBase & { type: 'updateColor'; ruleId: string; documentUri: string; color: string })
+	| (PanelMessageBase & { type: 'removeRule'; ruleId: string })
+	| (PanelMessageBase & { type: 'updatePattern'; ruleId: string; pattern: string })
+	| (PanelMessageBase & { type: 'updateColor'; ruleId: string; color: string })
 	| (PanelMessageBase & {
 			type: 'toggleOption';
 			ruleId: string;
-			documentUri: string;
 			option: RuleOptionKey;
+	  })
+	| (PanelMessageBase & {
+			type: 'changeScope';
+			ruleId: string;
+			scope: RuleScope;
+			documentUri: string;
 	  })
 	| (PanelMessageBase & {
 			type: 'navigate';
@@ -939,19 +1826,22 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 					void this.controller.createRuleFromPayload(message.payload);
 					break;
 				case 'removeRule':
-					this.controller.deleteRule(message.documentUri, message.ruleId);
+					this.controller.deleteRule(message.ruleId);
 					break;
 				case 'updatePattern':
-					this.controller.updateRulePattern(message.documentUri, message.ruleId, message.pattern);
+					this.controller.updateRulePattern(message.ruleId, message.pattern);
 					break;
 				case 'updateColor':
-					this.controller.updateRuleColor(message.documentUri, message.ruleId, message.color);
+					this.controller.updateRuleColor(message.ruleId, message.color);
 					break;
 				case 'toggleOption':
-					this.controller.toggleRuleOption(message.documentUri, message.ruleId, message.option);
+					this.controller.toggleRuleOption(message.ruleId, message.option);
+					break;
+				case 'changeScope':
+					void this.controller.changeRuleScope(message.ruleId, message.scope, message.documentUri);
 					break;
 				case 'navigate':
-					this.controller.navigateToMatch(message.documentUri, message.ruleId, message.direction);
+					void this.controller.navigateToMatch(message.documentUri, message.ruleId, message.direction);
 					break;
 				default:
 					break;
@@ -969,11 +1859,14 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		const editor = vscode.window.activeTextEditor;
 		const uri = editor?.document.uri.toString() ?? null;
 		const rules = this.controller.getRuleSnapshots(uri);
+		const scopeData = this.controller.getScopeSelectionData(editor?.document ?? null);
 
 		this.view.webview.postMessage({
 			type: 'rulesUpdate',
 			rules,
 			activeUri: uri,
+			scopeOptions: scopeData.options,
+			defaultScope: scopeData.defaultScope,
 		});
 	}
 
@@ -1060,13 +1953,17 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 
 		.form-options-row .options-toggle-row {
 			flex: 1;
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
 		}
 
 		.form-options-row .color-row {
 			flex-shrink: 0;
 		}
 
-		.options-toggle-row,
+		.options-toggle-row .option-buttons,
 		.rule-options {
 			display: flex;
 			gap: 6px;
@@ -1091,6 +1988,45 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			background: var(--vscode-button-background);
 			color: var(--vscode-button-foreground);
 			border-color: var(--vscode-button-background);
+		}
+
+		.scope-toggle-group {
+			display: inline-flex;
+			gap: 4px;
+			align-items: center;
+		}
+
+		.scope-toggle-button {
+			min-width: 72px;
+			height: 24px;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			padding: 0 6px;
+			border-radius: 4px;
+			border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder));
+			background: var(--vscode-sideBarSectionHeader-background, transparent);
+			color: var(--vscode-foreground);
+			font-size: 11px;
+			white-space: nowrap;
+		}
+
+		.scope-toggle-button.active {
+			background: var(--vscode-button-background);
+			color: var(--vscode-button-foreground);
+			border-color: var(--vscode-button-background);
+		}
+
+		.scope-toggle-button:disabled {
+			opacity: 0.5;
+		}
+
+		.filter-row {
+			display: flex;
+		}
+
+		.filter-row input {
+			width: 100%;
 		}
 
 		.color-row {
@@ -1302,18 +2238,24 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		</div>
 		<div id="newRuleForm" class="new-rule">
 			<input id="patternInput" type="text" placeholder="Highlight text or /regex/">
-			<div class="form-options-row">
-				<div class="options-toggle-row" id="newRuleOptions">
+		<div class="form-options-row">
+			<div class="options-toggle-row" id="newRuleOptions">
+				<div class="option-buttons">
 					<button type="button" class="option-toggle" data-option="matchCase" title="Match Case (Aa)">Aa</button>
 					<button type="button" class="option-toggle" data-option="matchWholeWord" title="Match Whole Word (W)">W</button>
 					<button type="button" class="option-toggle" data-option="useRegex" title="Use Regular Expression (.*)">.*</button>
-				</div>
-				<div class="color-row">
-					<input type="color" id="colorPicker" value="#00c400" aria-label="Highlight color">
-					<input type="text" id="colorText" class="color-text-hidden" value="#00c4005d" tabindex="-1" aria-hidden="true">
+					<button type="button" class="option-toggle scope-toggle-button" id="scopeToggleButton" title="Open a file to choose scope">Scope</button>
 				</div>
 			</div>
+			<div class="color-row">
+				<input type="color" id="colorPicker" value="#00c400" aria-label="Highlight color">
+				<input type="text" id="colorText" class="color-text-hidden" value="#00c4005d" tabindex="-1" aria-hidden="true">
+			</div>
 		</div>
+		<div class="filter-row">
+			<input type="text" id="fileFilterInput" placeholder="Extensions (e.g. *.txt|*.json|*.*)">
+		</div>
+	</div>
 		<div id="ruleList" class="rule-list"></div>
 		<div id="colorOverlay" class="color-overlay hidden" role="dialog" aria-modal="true">
 			<div class="color-overlay-content">
@@ -1337,12 +2279,19 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			formOptions: { matchCase: false, matchWholeWord: false, useRegex: false },
 			suggestedColor: null,
 			lastAppliedSuggestion: null,
+			scopeOptions: [],
+			selectedScope: null,
+			fileFilter: '*.*',
 		};
 		const listEl = document.getElementById('ruleList');
 		const patternInput = document.getElementById('patternInput');
 		const colorPicker = document.getElementById('colorPicker');
 		const colorText = document.getElementById('colorText');
-		const optionButtons = Array.from(document.querySelectorAll('#newRuleOptions .option-toggle'));
+		const optionButtons = Array.from(document.querySelectorAll('#newRuleOptions .option-toggle')).filter(
+			(button) => button instanceof HTMLElement && button.dataset.option
+		);
+		const scopeButton = document.getElementById('scopeToggleButton');
+		const fileFilterInput = document.getElementById('fileFilterInput');
 		const colorParserCanvas = document.createElement('canvas');
 		const colorParser = colorParserCanvas.getContext('2d');
 		const colorOverlay = document.getElementById('colorOverlay');
@@ -1354,15 +2303,38 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 
 		applyOptionButtonState();
 
+		let formEnabled = false;
+
 		const OPTION_META = [
 			{ key: 'matchCase', label: 'Aa', title: 'Match Case' },
 			{ key: 'matchWholeWord', label: 'W', title: 'Match Whole Word' },
 			{ key: 'useRegex', label: '.*', title: 'Use Regular Expression' },
 		];
+		const SCOPE_META = [
+			{ scope: 'document', label: 'F', title: 'Current file only (F)' },
+			{ scope: 'folder', label: 'D', title: 'Current folder only (D)' },
+			{ scope: 'folderRecursive', label: 'D+', title: 'Folder and subfolders (D+)' },
+		];
 		const BASE_COLORS = ['#00c4ff', '#ffd400', '#8ac926', '#ff595e', '#6a4c93', '#1982c4', '#ff924c', '#fb5607'];
 		const DEFAULT_ALPHA = '80';
 
 		setFormEnabled(false);
+		updateScopeButtonState();
+		if (fileFilterInput instanceof HTMLInputElement) {
+			fileFilterInput.value = state.fileFilter;
+			fileFilterInput.addEventListener('input', () => {
+				state.fileFilter = fileFilterInput.value;
+			});
+		}
+
+		if (scopeButton instanceof HTMLButtonElement) {
+			scopeButton.addEventListener('click', () => {
+				if (scopeButton.disabled) {
+					return;
+				}
+				cycleScope();
+			});
+		}
 
 		function applyOptionButtonState() {
 			optionButtons.forEach((button) => {
@@ -1371,6 +2343,115 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 					return;
 				}
 				button.classList.toggle('active', !!state.formOptions[key]);
+			});
+		}
+
+		function getAvailableScopes() {
+			const scopes = state.scopeOptions.map((option) => option.scope);
+			return scopes.filter((scope, index) => scopes.indexOf(scope) === index);
+		}
+
+		function getOrderedScopes() {
+			const available = getAvailableScopes();
+			return SCOPE_META.filter((meta) => available.includes(meta.scope));
+		}
+
+		function getNextScopeValue(currentScope) {
+			const ordered = getOrderedScopes();
+			if (!ordered.length) {
+				return null;
+			}
+			if (!currentScope) {
+				return ordered[0].scope;
+			}
+			const currentIndex = ordered.findIndex((meta) => meta.scope === currentScope);
+			if (currentIndex === -1) {
+				return ordered[0].scope;
+			}
+			return ordered[(currentIndex + 1) % ordered.length].scope;
+		}
+
+		function getScopeMeta(scope) {
+			return SCOPE_META.find((meta) => meta.scope === scope) ?? null;
+		}
+
+		function setScopeButtonAppearance(button, scope) {
+			if (!(button instanceof HTMLButtonElement)) {
+				return;
+			}
+			const meta = scope ? getScopeMeta(scope) : null;
+			if (!meta) {
+				button.textContent = 'Scope';
+				button.title = 'Open a file to choose scope';
+				return;
+			}
+			button.textContent = meta.label;
+			button.title = meta.title;
+		}
+
+		function cycleScope() {
+			const nextScope = getNextScopeValue(state.selectedScope);
+			if (!nextScope) {
+				return;
+			}
+			state.selectedScope = nextScope;
+			updateScopeButtonState();
+		}
+
+		function updateScopeButtonState() {
+			if (!(scopeButton instanceof HTMLButtonElement)) {
+				return;
+			}
+			const available = getAvailableScopes();
+			if (!available.length) {
+				state.selectedScope = null;
+				scopeButton.disabled = true;
+				scopeButton.textContent = 'Scope';
+				scopeButton.title = 'Open a file to choose scope';
+				scopeButton.classList.remove('active');
+				return;
+			}
+			if (!state.selectedScope || !available.includes(state.selectedScope)) {
+				state.selectedScope = available[0];
+			}
+			scopeButton.disabled = !formEnabled;
+			setScopeButtonAppearance(scopeButton, state.selectedScope);
+			scopeButton.classList.toggle('active', formEnabled);
+		}
+
+		function updateScopeOptions(options, defaultScope) {
+			state.scopeOptions = Array.isArray(options) ? options : [];
+			if (!state.scopeOptions.some((option) => option.scope === state.selectedScope)) {
+				if (
+					defaultScope &&
+					state.scopeOptions.some((option) => option.scope === defaultScope)
+				) {
+					state.selectedScope = defaultScope;
+				} else {
+					state.selectedScope = state.scopeOptions[0]?.scope ?? null;
+				}
+			}
+			updateScopeButtonState();
+		}
+
+		function cycleRuleScope(row) {
+			if (!row) {
+				return;
+			}
+			const documentUri = row.dataset.uri || state.activeUri;
+			if (!documentUri) {
+				return;
+			}
+			const currentScope = row.dataset.scope || null;
+			const nextScope = getNextScopeValue(currentScope);
+			if (!nextScope) {
+				return;
+			}
+			vscode.postMessage({
+				type: 'changeScope',
+				ruleId: row.dataset.ruleId,
+				scope: nextScope,
+				documentUri,
 			});
 		}
 
@@ -1399,6 +2480,8 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				row.dataset.ruleId = rule.id;
 				row.dataset.uri = rule.documentUri;
 				row.dataset.color = rule.color;
+				row.dataset.scope = rule.scope;
+				row.dataset.targetUri = rule.targetUri;
 
 				const main = document.createElement('div');
 				main.className = 'rule-main';
@@ -1459,12 +2542,24 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 					button.title = meta.title;
 					optionRow.appendChild(button);
 				});
+				const scopeToggleButton = document.createElement('button');
+				scopeToggleButton.type = 'button';
+				scopeToggleButton.className = 'option-toggle scope-toggle-button';
+				scopeToggleButton.dataset.role = 'scope';
+				setScopeButtonAppearance(scopeToggleButton, rule.scope);
+				optionRow.appendChild(scopeToggleButton);
 				secondRow.appendChild(optionRow);
 				secondRow.appendChild(colorButton);
 
 				const matchBadge = document.createElement('div');
 				matchBadge.className = 'match-count';
-				updateMatchBadge(matchBadge, rule.matchCount, rule.currentMatchIndex);
+				updateMatchBadge(
+					matchBadge,
+					rule.matchCount,
+					rule.currentMatchIndex,
+					rule.documentMatchCount,
+					rule.documentMatchIndex
+				);
 				secondRow.appendChild(matchBadge);
 
 				main.appendChild(primaryRow);
@@ -1485,22 +2580,36 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			element.style.color = contrast || '';
 		}
 
-		function updateMatchBadge(element, total, currentIndex) {
+		function updateMatchBadge(element, total, currentIndex, documentCount, documentIndex) {
 			if (!(element instanceof HTMLElement)) {
 				return;
 			}
 			const totalCount = Number.isFinite(total) ? Number(total) : 0;
-			const current =
+			const globalIndex =
 				typeof currentIndex === 'number' && Number.isFinite(currentIndex) ? Math.trunc(currentIndex) : null;
-			const withinRange = current !== null && current > 0 && current <= Math.max(totalCount, 1);
+			const localCount =
+				typeof documentCount === 'number' && Number.isFinite(documentCount) ? Math.trunc(documentCount) : 0;
+			const localIndex =
+				typeof documentIndex === 'number' && Number.isFinite(documentIndex) ? Math.trunc(documentIndex) : null;
+			const showFraction = globalIndex !== null && totalCount > 0;
 
-			if (withinRange && totalCount > 0) {
-				element.textContent = current + ' / ' + totalCount;
-				element.title = 'Match ' + current + ' of ' + totalCount;
+			if (showFraction) {
+				element.textContent = globalIndex + ' / ' + totalCount;
 			} else {
 				element.textContent = totalCount.toString();
-				element.title = totalCount === 1 ? '1 hit' : totalCount + ' hits';
 			}
+
+			let title = totalCount === 1 ? '1 hit across scope' : totalCount + ' hits across scope';
+			if (localCount > 0) {
+				title += localCount === 1 ? ' - 1 hit in this file' : ' - ' + localCount + ' hits in this file';
+				if (localIndex && localIndex <= localCount) {
+					title += ' (match ' + localIndex + ' of ' + localCount + ')';
+				}
+			} else {
+				title += ' - none in this file';
+			}
+			element.title = title;
+
 			element.classList.toggle('has-matches', totalCount > 0);
 			element.classList.toggle('empty', totalCount === 0);
 		}
@@ -1633,7 +2742,6 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 					vscode.postMessage({
 						type: 'updatePattern',
 						ruleId: row.dataset.ruleId,
-						documentUri: row.dataset.uri,
 						pattern: nextValue,
 					});
 					(display).textContent = nextValue;
@@ -1663,8 +2771,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				return;
 			}
 			const ruleId = row.dataset.ruleId;
-			const documentUri = row.dataset.uri;
-			if (!ruleId || !documentUri) {
+			if (!ruleId) {
 				return;
 			}
 
@@ -1680,7 +2787,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				inlineColorText.setSelectionRange(0, inlineColorText.value.length);
 			}
 
-			colorEditorState = { ruleId, documentUri, row, alphaSuffix };
+			colorEditorState = { ruleId, row, alphaSuffix };
 			colorOverlay.classList.remove('hidden');
 			(inlineColorText.value ? inlineColorText : inlineColorPicker).focus();
 		}
@@ -1693,7 +2800,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				colorOverlay.classList.add('hidden');
 				return;
 			}
-			const { ruleId, documentUri, row, alphaSuffix } = colorEditorState;
+			const { ruleId, row, alphaSuffix } = colorEditorState;
 			colorEditorState = null;
 
 			let nextColor = '';
@@ -1716,7 +2823,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				return;
 			}
 
-			vscode.postMessage({ type: 'updateColor', ruleId, documentUri, color: nextColor });
+			vscode.postMessage({ type: 'updateColor', ruleId, color: nextColor });
 			row.dataset.color = nextColor;
 			const patternButton = row.querySelector('.pattern-button');
 			if (patternButton instanceof HTMLElement) {
@@ -1752,7 +2859,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			}
 
 			if (target?.closest('.remove-rule')) {
-				vscode.postMessage({ type: 'removeRule', ruleId, documentUri: uri });
+				vscode.postMessage({ type: 'removeRule', ruleId });
 				return;
 			}
 
@@ -1761,11 +2868,15 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				return;
 			}
 
-			if (target?.closest('.option-toggle')) {
-				const optionButton = target.closest('.option-toggle');
-				const optionKey = optionButton?.dataset.option;
-				if (optionKey) {
-					vscode.postMessage({ type: 'toggleOption', ruleId, documentUri: uri, option: optionKey });
+			const optionButton = target?.closest('.option-toggle');
+			if (optionButton) {
+				if (optionButton.dataset.role === 'scope') {
+					cycleRuleScope(row);
+				} else {
+					const optionKey = optionButton.dataset.option;
+					if (optionKey) {
+						vscode.postMessage({ type: 'toggleOption', ruleId, option: optionKey });
+					}
 				}
 				return;
 			}
@@ -1813,6 +2924,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		});
 
 		function setFormEnabled(enabled) {
+			formEnabled = enabled;
 			if (patternInput instanceof HTMLInputElement) {
 				patternInput.disabled = !enabled;
 				patternInput.placeholder = enabled ? 'Highlight text or /regex/' : 'Open a file to add highlights.';
@@ -1826,6 +2938,10 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			if (colorText instanceof HTMLInputElement) {
 				colorText.disabled = !enabled;
 			}
+			if (fileFilterInput instanceof HTMLInputElement) {
+				fileFilterInput.disabled = !enabled;
+			}
+			updateScopeButtonState();
 			if (!enabled) {
 				state.suggestedColor = null;
 				state.lastAppliedSuggestion = null;
@@ -1928,6 +3044,8 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			}
 			const pattern = patternInput.value.trim();
 			const colorValue = (colorText.value || colorPicker?.value || '').trim();
+			const filterValue =
+				fileFilterInput instanceof HTMLInputElement ? fileFilterInput.value.trim() : '';
 			if (!pattern || !colorValue) {
 				return;
 			}
@@ -1941,7 +3059,9 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 					matchCase: options.matchCase,
 					matchWholeWord: options.matchWholeWord,
 					useRegex: options.useRegex,
+					scope: state.selectedScope || state.scopeOptions[0]?.scope || 'document',
 					documentUri: state.activeUri,
+					fileFilter: filterValue || undefined,
 				},
 			});
 			state.lastAppliedSuggestion = colorValue.toLowerCase();
@@ -1993,6 +3113,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				if (message.type === 'rulesUpdate') {
 					state.rules = Array.isArray(message.rules) ? message.rules : [];
 					state.activeUri = message.activeUri || null;
+					updateScopeOptions(message.scopeOptions || [], message.defaultScope || null);
 					if (!state.activeUri) {
 						setFormEnabled(false);
 						resetFormFields();
@@ -2028,3 +3149,5 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
+
+
