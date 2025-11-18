@@ -88,6 +88,21 @@ interface ScopeOptionPickItem extends vscode.QuickPickItem {
 	option: ScopeOptionDetails;
 }
 
+interface ExportedRuleDefinition {
+	pattern: string;
+	color: string;
+	matchCase: boolean;
+	matchWholeWord: boolean;
+	useRegex: boolean;
+	scope: RuleScope;
+	fileFilter?: string;
+}
+
+interface ExportedRuleFile {
+	version: number;
+	rules: ExportedRuleDefinition[];
+}
+
 class HighlightController {
 	private readonly rulesByScope: RuleMap = new Map();
 	private readonly ruleIndex = new Map<string, HighlightRule>();
@@ -103,6 +118,11 @@ class HighlightController {
 	private static readonly configWordPatternCache = new Map<string, RegExp | null>();
 	private static readonly SCOPE_SCAN_EXCLUDES = ['**/node_modules/**', '**/.git/**', '**/out/**', '**/dist/**', '**/build/**'];
 	private static readonly SCOPE_SCAN_MAX_FILES = 2000;
+	private static readonly EXPORT_SCHEMA_VERSION = 1;
+	private static readonly EXPORT_FILE_FILTERS = {
+		'Smart Highlights Rules': ['json', 'shrules'],
+		JSON: ['json'],
+	};
 
 	private static getScopeCreationMessage(scope: RuleScope): string {
 		switch (scope) {
@@ -126,6 +146,45 @@ class HighlightController {
 			default:
 				return 'File only';
 		}
+	}
+
+	private static serializeRuleDefinition(rule: HighlightRule): ExportedRuleDefinition {
+		return {
+			pattern: rule.pattern,
+			color: rule.color,
+			matchCase: rule.matchCase,
+			matchWholeWord: rule.matchWholeWord,
+			useRegex: rule.useRegex,
+			scope: rule.scope,
+			fileFilter: rule.fileFilter,
+		};
+	}
+
+	private static normalizeImportedRuleDefinition(data: unknown): ExportedRuleDefinition | null {
+		if (!data || typeof data !== 'object') {
+			return null;
+		}
+		const value = data as Record<string, unknown>;
+		const pattern = typeof value.pattern === 'string' ? value.pattern : null;
+		const color = typeof value.color === 'string' ? value.color : null;
+		const scope =
+			value.scope === 'document' || value.scope === 'folder' || value.scope === 'folderRecursive'
+				? value.scope
+				: null;
+		if (!pattern || !color || !scope) {
+			return null;
+		}
+		const fileFilter =
+			typeof value.fileFilter === 'string' && value.fileFilter.trim().length > 0 ? value.fileFilter : undefined;
+		return {
+			pattern,
+			color,
+			scope,
+			matchCase: Boolean(value.matchCase),
+			matchWholeWord: Boolean(value.matchWholeWord),
+			useRegex: Boolean(value.useRegex),
+			fileFilter,
+		};
 	}
 
 	public readonly onDidChangeRules = this.onDidChangeRulesEmitter.event;
@@ -369,6 +428,135 @@ class HighlightController {
 		this.refreshEditorsForRule(rule);
 		this.scheduleScopeScan(rule);
 		this.notifyRulesChanged();
+	}
+
+	public async exportRules() {
+		const rules = [...this.ruleIndex.values()];
+		if (rules.length === 0) {
+			void vscode.window.showInformationMessage('There are no highlight rules to export.');
+			return;
+		}
+
+		const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+		const defaultFileName = 'smart-highlights-rules.json';
+		const defaultUri = workspaceFolder
+			? vscode.Uri.joinPath(workspaceFolder.uri, defaultFileName)
+			: undefined;
+
+		const saveUri = await vscode.window.showSaveDialog({
+			saveLabel: 'Export Smart Highlights Rules',
+			filters: HighlightController.EXPORT_FILE_FILTERS,
+			defaultUri,
+		});
+		if (!saveUri) {
+			return;
+		}
+
+		const exportData: ExportedRuleFile = {
+			version: HighlightController.EXPORT_SCHEMA_VERSION,
+			rules: rules.map((rule) => HighlightController.serializeRuleDefinition(rule)),
+		};
+
+		try {
+			await fs.promises.writeFile(saveUri.fsPath, JSON.stringify(exportData, null, 2), 'utf8');
+			void vscode.window.showInformationMessage(
+				`Exported ${rules.length} highlight ${rules.length === 1 ? 'rule' : 'rules'} to ${saveUri.fsPath}.`
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			void vscode.window.showErrorMessage(`Failed to export highlight rules: ${message}`);
+		}
+	}
+
+	public async importRules(documentUri?: string | null) {
+		const targetUriString =
+			documentUri ??
+			vscode.window.activeTextEditor?.document.uri.toString() ??
+			null;
+		if (!targetUriString) {
+			void vscode.window.showErrorMessage('Open a text editor before importing highlight rules.');
+			return;
+		}
+
+		const pick = await vscode.window.showOpenDialog({
+			canSelectMany: false,
+			openLabel: 'Import Smart Highlights Rules',
+			filters: HighlightController.EXPORT_FILE_FILTERS,
+		});
+		if (!pick || pick.length === 0) {
+			return;
+		}
+		const fileUri = pick[0];
+
+		let parsed: ExportedRuleFile | null = null;
+		try {
+			const raw = await fs.promises.readFile(fileUri.fsPath, 'utf8');
+			const data = JSON.parse(raw);
+			if (
+				!data ||
+				typeof data !== 'object' ||
+				typeof (data as ExportedRuleFile).version !== 'number' ||
+				!Array.isArray((data as ExportedRuleFile).rules)
+			) {
+				throw new Error('File is missing required fields.');
+			}
+			if ((data as ExportedRuleFile).version !== HighlightController.EXPORT_SCHEMA_VERSION) {
+				throw new Error('Unsupported export file version.');
+			}
+			parsed = data as ExportedRuleFile;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			void vscode.window.showErrorMessage(`Failed to import highlight rules: ${message}`);
+			return;
+		}
+
+		const normalizedRules: ExportedRuleDefinition[] = [];
+		for (const rule of parsed.rules) {
+			const normalized = HighlightController.normalizeImportedRuleDefinition(rule);
+			if (normalized) {
+				normalizedRules.push(normalized);
+			}
+		}
+
+		if (normalizedRules.length === 0) {
+			void vscode.window.showErrorMessage('No valid highlight rules were found in the selected file.');
+			return;
+		}
+
+		const targetUri = vscode.Uri.parse(targetUriString);
+		const document =
+			vscode.workspace.textDocuments.find((doc) => doc.uri.toString() === targetUriString) ??
+			(await vscode.workspace.openTextDocument(targetUri));
+		const editor =
+			vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === targetUriString) ??
+			(await vscode.window.showTextDocument(document));
+
+		let createdCount = 0;
+		for (const rule of normalizedRules) {
+			const createdRule = this.createRuleFromOptions(
+				editor,
+				{
+					pattern: rule.pattern,
+					color: rule.color,
+					matchCase: rule.matchCase,
+					matchWholeWord: rule.matchWholeWord,
+					useRegex: rule.useRegex,
+					fileFilter: rule.fileFilter,
+				},
+				rule.scope
+			);
+			if (createdRule) {
+				createdCount += 1;
+			}
+		}
+
+		if (createdCount === 0) {
+			void vscode.window.showInformationMessage('No new highlight rules were added.');
+			return;
+		}
+		void vscode.window.showInformationMessage(
+			`Imported ${createdCount} highlight ${createdCount === 1 ? 'rule' : 'rules'}.`
+		);
 	}
 
 	public async changeRuleScope(ruleId: string, scope: RuleScope, documentUri: string): Promise<boolean> {
@@ -1772,6 +1960,8 @@ type PanelMessage =
 			ruleId: string;
 			option: RuleOptionKey;
 	  })
+	| (PanelMessageBase & { type: 'exportRules' })
+	| (PanelMessageBase & { type: 'importRules'; documentUri: string | null })
 	| (PanelMessageBase & {
 			type: 'changeScope';
 			ruleId: string;
@@ -1836,6 +2026,12 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 					break;
 				case 'toggleOption':
 					this.controller.toggleRuleOption(message.ruleId, message.option);
+					break;
+				case 'exportRules':
+					void this.controller.exportRules();
+					break;
+				case 'importRules':
+					void this.controller.importRules(message.documentUri);
 					break;
 				case 'changeScope':
 					void this.controller.changeRuleScope(message.ruleId, message.scope, message.documentUri);
@@ -1906,6 +2102,16 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			font-weight: 600;
 			font-size: 12px;
 			letter-spacing: 0.05em;
+		}
+
+		.header-actions {
+			display: flex;
+			gap: 6px;
+		}
+
+		.header-button {
+			min-width: 60px;
+			padding: 2px 10px;
 		}
 
 		button {
@@ -2235,6 +2441,10 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 	<div class="panel">
 		<div class="panel-header">
 			<span class="header-title">Highlights</span>
+			<div class="header-actions">
+				<button type="button" id="exportRulesButton" class="header-button" title="Export highlight rules">Export</button>
+				<button type="button" id="importRulesButton" class="header-button" title="Import highlight rules">Import</button>
+			</div>
 		</div>
 		<div id="newRuleForm" class="new-rule">
 			<input id="patternInput" type="text" placeholder="Highlight text or /regex/">
@@ -2290,6 +2500,8 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		const optionButtons = Array.from(document.querySelectorAll('#newRuleOptions .option-toggle')).filter(
 			(button) => button instanceof HTMLElement && button.dataset.option
 		);
+		const exportRulesButton = document.getElementById('exportRulesButton');
+		const importRulesButton = document.getElementById('importRulesButton');
 		const scopeButton = document.getElementById('scopeToggleButton');
 		const fileFilterInput = document.getElementById('fileFilterInput');
 		const colorParserCanvas = document.createElement('canvas');
@@ -2320,12 +2532,24 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 
 		setFormEnabled(false);
 		updateScopeButtonState();
+		updateHeaderButtons();
 		if (fileFilterInput instanceof HTMLInputElement) {
 			fileFilterInput.value = state.fileFilter;
 			fileFilterInput.addEventListener('input', () => {
 				state.fileFilter = fileFilterInput.value;
 			});
 		}
+
+		exportRulesButton?.addEventListener('click', () => {
+			vscode.postMessage({ type: 'exportRules' });
+		});
+
+		importRulesButton?.addEventListener('click', () => {
+			if (importRulesButton instanceof HTMLButtonElement && importRulesButton.disabled) {
+				return;
+			}
+			vscode.postMessage({ type: 'importRules', documentUri: state.activeUri });
+		});
 
 		if (scopeButton instanceof HTMLButtonElement) {
 			scopeButton.addEventListener('click', () => {
@@ -2432,6 +2656,16 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				}
 			}
 			updateScopeButtonState();
+		}
+
+		function updateHeaderButtons() {
+			if (importRulesButton instanceof HTMLButtonElement) {
+				const hasActiveEditor = !!state.activeUri;
+				importRulesButton.disabled = !hasActiveEditor;
+				importRulesButton.title = hasActiveEditor
+					? 'Import highlight rules into this workspace'
+					: 'Open a file to import highlight rules';
+			}
 		}
 
 		function cycleRuleScope(row) {
@@ -2942,6 +3176,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				fileFilterInput.disabled = !enabled;
 			}
 			updateScopeButtonState();
+			updateHeaderButtons();
 			if (!enabled) {
 				state.suggestedColor = null;
 				state.lastAppliedSuggestion = null;
@@ -3113,6 +3348,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				if (message.type === 'rulesUpdate') {
 					state.rules = Array.isArray(message.rules) ? message.rules : [];
 					state.activeUri = message.activeUri || null;
+					updateHeaderButtons();
 					updateScopeOptions(message.scopeOptions || [], message.defaultScope || null);
 					if (!state.activeUri) {
 						setFormEnabled(false);
