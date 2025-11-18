@@ -6,6 +6,7 @@ Smart Highlights lets you highlight any text in the active editor using custom c
 
 - Maintain multiple highlight rules per file, each with independent search options and colors.
 - Toggle match case, match whole word, and regular expression modes for every rule.
+- Choose whether a rule applies only to the current file, every file in the workspace folder, or the entire workspace.
 - Remove a single highlight rule or clear all rules that apply to the current editor.
 - Decorations react to document edits, so highlights stay aligned with changing content.
 
@@ -15,7 +16,8 @@ Use the Smart Highlights side panel to add, edit, or remove highlight rules. Eac
 
 Open the **Smart Highlights** view from the Activity Bar to access a dedicated panel:
 
-- An always-visible form lets you type the keyword/regex, flip the `Aa` / `W` / `.*` option icons (their state is remembered), and the color field automatically rotates to a new unused color each time you add a rule—just press Enter to create it instantly.
+- An always-visible form lets you type the keyword/regex, flip the `Aa` / `W` / `.*` option icons (their state is remembered), and the color field automatically rotates to a new unused color each time you add a rule - just press Enter to create it instantly.
+- Pick the scope ("Current File", "Workspace Folder", or "Entire Workspace") from the dropdown before submitting the form so the new rule lands exactly where you expect.
 - Each listed rule shows its pattern with a live color preview; the text color automatically adjusts for readability.
 - Toggle the `Aa` / `W` / `.*` icons next to a rule to change its search mode, or click the pattern to edit it inline.
 - Click the color swatch to choose a new color, or use the up/down buttons to move to the previous/next match in the file.
