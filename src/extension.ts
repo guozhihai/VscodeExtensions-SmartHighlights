@@ -2213,8 +2213,14 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder));
 			background: var(--vscode-sideBarSectionHeader-background, transparent);
 			color: var(--vscode-foreground);
-			font-size: 11px;
+			font-size: 12px;
 			white-space: nowrap;
+		}
+
+		.scope-toggle-button.scope-toggle-compact {
+			min-width: 32px;
+			width: 32px;
+			padding: 0;
 		}
 
 		.scope-toggle-button.active {
@@ -2607,10 +2613,12 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			if (!meta) {
 				button.textContent = 'Scope';
 				button.title = 'Open a file to choose scope';
+				button.classList.remove('scope-toggle-compact');
 				return;
 			}
 			button.textContent = meta.label;
 			button.title = meta.title;
+			button.classList.add('scope-toggle-compact');
 		}
 
 		function cycleScope() {
@@ -2632,6 +2640,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				scopeButton.disabled = true;
 				scopeButton.textContent = 'Scope';
 				scopeButton.title = 'Open a file to choose scope';
+				scopeButton.classList.remove('scope-toggle-compact');
 				scopeButton.classList.remove('active');
 				return;
 			}
