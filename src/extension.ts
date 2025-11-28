@@ -2475,7 +2475,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				<input type="text" id="colorText" class="color-text-hidden" value="#00c4005d" tabindex="-1" aria-hidden="true">
 			</div>
 		</div>
-		<div class="filter-row">
+		<div class="filter-row" id="fileFilterRow">
 			<input type="text" id="fileFilterInput" placeholder="Extensions (e.g. *.txt|*.json|*.*)">
 		</div>
 	</div>
@@ -2517,6 +2517,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		const importRulesButton = document.getElementById('importRulesButton');
 		const scopeButton = document.getElementById('scopeToggleButton');
 		const fileFilterInput = document.getElementById('fileFilterInput');
+		const fileFilterRow = document.getElementById('fileFilterRow');
 		const colorParserCanvas = document.createElement('canvas');
 		const colorParser = colorParserCanvas.getContext('2d');
 		const colorOverlay = document.getElementById('colorOverlay');
@@ -2630,6 +2631,21 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			button.classList.add('scope-toggle-compact');
 		}
 
+		function shouldShowFileFilter(scope) {
+			return scope === 'folder' || scope === 'folderRecursive';
+		}
+
+		function updateFileFilterVisibility() {
+			if (!(fileFilterRow instanceof HTMLElement)) {
+				return;
+			}
+			const visible = shouldShowFileFilter(state.selectedScope);
+			fileFilterRow.style.display = visible ? '' : 'none';
+			if (fileFilterInput instanceof HTMLInputElement) {
+				fileFilterInput.disabled = !formEnabled || !visible;
+			}
+		}
+
 		function cycleScope() {
 			const nextScope = getNextScopeValue(state.selectedScope);
 			if (!nextScope) {
@@ -2652,6 +2668,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				scopeButton.classList.add('scope-toggle-placeholder');
 				scopeButton.classList.remove('scope-toggle-compact');
 				scopeButton.classList.remove('active');
+				updateFileFilterVisibility();
 				return;
 			}
 			if (!state.selectedScope || !available.includes(state.selectedScope)) {
@@ -2659,6 +2676,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			}
 			scopeButton.disabled = !formEnabled;
 			setScopeButtonAppearance(scopeButton, state.selectedScope);
+			updateFileFilterVisibility();
 		}
 
 		function updateScopeOptions(options, defaultScope) {
@@ -3191,9 +3209,6 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			if (colorText instanceof HTMLInputElement) {
 				colorText.disabled = !enabled;
 			}
-			if (fileFilterInput instanceof HTMLInputElement) {
-				fileFilterInput.disabled = !enabled;
-			}
 			updateScopeButtonState();
 			updateHeaderButtons();
 			if (!enabled) {
@@ -3298,8 +3313,9 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			}
 			const pattern = patternInput.value.trim();
 			const colorValue = (colorText.value || colorPicker?.value || '').trim();
+			const shouldUseFileFilter = shouldShowFileFilter(state.selectedScope);
 			const filterValue =
-				fileFilterInput instanceof HTMLInputElement ? fileFilterInput.value.trim() : '';
+				shouldUseFileFilter && fileFilterInput instanceof HTMLInputElement ? fileFilterInput.value.trim() : '';
 			if (!pattern || !colorValue) {
 				return;
 			}
@@ -3315,7 +3331,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 					useRegex: options.useRegex,
 					scope: state.selectedScope || state.scopeOptions[0]?.scope || 'document',
 					documentUri: state.activeUri,
-					fileFilter: filterValue || undefined,
+					fileFilter: shouldUseFileFilter && filterValue ? filterValue : undefined,
 				},
 			});
 			state.lastAppliedSuggestion = colorValue.toLowerCase();
