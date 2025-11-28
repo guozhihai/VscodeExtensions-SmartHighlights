@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.5 ? 2025-11-28
+- Align scope toggle button size/appearance with other option toggles and default to file scope.
+- Show the current match in the list when navigating with the ▼▲ buttons.
+- Add `media/operation.mp4` demo video for quick usage overview.
+
 ## 0.0.4 ? 2025-11-??
 - Add export/import commands for highlight rule lists so they can be reused in other workspaces.
 

@@ -13,6 +13,10 @@ Smart Highlights lets you highlight any text in the active editor using custom c
 
 Use the Smart Highlights side panel to add, edit, or remove highlight rules. Each rule can target any text (plain string or regex) with independent search options and colors. Use any CSS color string (named colors, `rgba()`, or hex values such as `#00c4ff55`). When "Use Regular Expression" is selected the pattern follows the JavaScript syntax used by VS Code searches. Whole-word matching wraps the underlying pattern with `\b` boundaries.
 
+## Demo Video
+
+A short walkthrough is included at `media/operation.mp4` (open it locally to see basic operations).
+
 ## Highlight Panel
 
 Open the **Smart Highlights** view from the Activity Bar to access a dedicated panel:

@@ -1455,10 +1455,6 @@ class HighlightController {
 			return resolvePreferred(preferredScope);
 		}
 
-		if (folderRecursiveInfo) {
-			return folderRecursiveInfo;
-		}
-
 		return documentInfo;
 	}
 
@@ -2203,12 +2199,12 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		}
 
 		.scope-toggle-button {
-			min-width: 72px;
+			width: 32px;
 			height: 24px;
 			display: inline-flex;
 			align-items: center;
 			justify-content: center;
-			padding: 0 6px;
+			padding: 0;
 			border-radius: 4px;
 			border: 1px solid var(--vscode-input-border, var(--vscode-focusBorder));
 			background: var(--vscode-sideBarSectionHeader-background, transparent);
@@ -2220,7 +2216,12 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		.scope-toggle-button.scope-toggle-compact {
 			min-width: 32px;
 			width: 32px;
-			padding: 0;
+		}
+
+		.scope-toggle-button.scope-toggle-placeholder {
+			min-width: 72px;
+			width: auto;
+			padding: 0 6px;
 		}
 
 		.scope-toggle-button.active {
@@ -2361,6 +2362,12 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 		.match-count.has-matches {
 			color: var(--vscode-foreground);
 			border-color: var(--vscode-focusBorder, var(--vscode-input-border));
+		}
+
+		.match-count.current {
+			background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+			color: var(--vscode-button-foreground);
+			border-color: var(--vscode-button-background);
 		}
 
 		.match-count.empty {
@@ -2613,11 +2620,13 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			if (!meta) {
 				button.textContent = 'Scope';
 				button.title = 'Open a file to choose scope';
+				button.classList.add('scope-toggle-placeholder');
 				button.classList.remove('scope-toggle-compact');
 				return;
 			}
 			button.textContent = meta.label;
 			button.title = meta.title;
+			button.classList.remove('scope-toggle-placeholder');
 			button.classList.add('scope-toggle-compact');
 		}
 
@@ -2640,6 +2649,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 				scopeButton.disabled = true;
 				scopeButton.textContent = 'Scope';
 				scopeButton.title = 'Open a file to choose scope';
+				scopeButton.classList.add('scope-toggle-placeholder');
 				scopeButton.classList.remove('scope-toggle-compact');
 				scopeButton.classList.remove('active');
 				return;
@@ -2649,7 +2659,6 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 			}
 			scopeButton.disabled = !formEnabled;
 			setScopeButtonAppearance(scopeButton, state.selectedScope);
-			scopeButton.classList.toggle('active', formEnabled);
 		}
 
 		function updateScopeOptions(options, defaultScope) {
@@ -2855,6 +2864,7 @@ class HighlightPanelProvider implements vscode.WebviewViewProvider {
 
 			element.classList.toggle('has-matches', totalCount > 0);
 			element.classList.toggle('empty', totalCount === 0);
+			element.classList.toggle('current', showFraction);
 		}
 
 		function getContrastColor(color) {
