@@ -4,6 +4,7 @@
 - Hide the extension filter field when the scope toggle is set to file (F) and only apply it for folder scopes (D/D+).
 - Replace the demo video reference with an embedded GIF for Marketplace listing display.
 - Clean up README for end-user focus ahead of release.
+- Exclude the demo GIF from the VSIX to reduce package size while keeping it in the repository.
 
 ## 0.0.5 ? 2025-11-28
 - Align scope toggle button size/appearance with other option toggles and default to file scope.
